@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""BlueOS Complete Data Logger.
+
+Records MAVLink, BlueOS service state, kernel messages and BlueOS service logs into one MCAP file per run.
+Every message carries three times, mirroring how ArduPilot logs time (TimeUS + RTC records):
+  mono_ns       CLOCK_MONOTONIC when the message arrived. Never jumps; resets on reboot.
+  wall_ns       CLOCK_REALTIME when the message arrived, i.e. what Linux believed the time was.
+  corrected_ns  mono_ns + the shift from the latest time sync. This is also the MCAP log_time.
+Every time sync is recorded on /time/sync, so any time can be recomputed afterwards.
+"""
+
+import asyncio
+import ctypes
+import errno
+import json
+import os
+import re
+import shutil
+import signal
+import time
+import urllib.request
+from datetime import datetime, timezone
+from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from threading import Thread
+from urllib.parse import quote, unquote, urlparse
+
+import websockets
+from mcap.writer import Writer
+
+VERSION = os.environ.get("VERSION", "0.0.0")
+HOST = os.environ.get("BLUEOS_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "9650"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
+SERVICE_LOGS = Path(os.environ.get("SERVICE_LOGS", "/var/logs/blueos/services"))
+MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_MB", "1024")) * 2**20
+
+# SYSTEM_TIME arrives over a websocket, so its shift estimate jitters by the delivery latency.
+AUTOPILOT_STEP_NS = 1_000_000_000
+# Same idea as ArduPilot's oldest_acceptable_date: anything earlier is an unset clock.
+OLDEST_VALID_NS = 1_704_067_200 * 10**9  # 2024-01-01
+
+# (path behind the BlueOS nginx, period in seconds, record every poll). When the last field is False the answer is
+# only recorded when it changes, which is what keeps big, mostly static structures (bag of holding, v4l) cheap.
+POLLS = [
+    ("/system-information/system/cpu", 1, True),
+    ("/system-information/system/memory", 1, True),
+    ("/system-information/system/temperature", 1, True),
+    ("/system-information/system/network", 1, True),
+    ("/system-information/system/disk", 5, True),
+    ("/kraken/v1.0/stats", 5, True),
+    ("/system-information/system/process", 10, True),
+    ("/system-information/platform", 5, False),
+    ("/system-information/system/info", 30, False),
+    ("/system-information/model", 60, False),
+    ("/system-information/serial?udev=true", 10, False),
+    ("/system-information/netstat", 10, False),
+    ("/kraken/v1.0/installed_extensions", 10, False),
+    ("/kraken/v1.0/list_containers", 10, False),
+    ("/bag/v1.0/get/*", 30, False),
+    ("/ardupilot-manager/v1.0/firmware_info", 30, False),
+    ("/ardupilot-manager/v1.0/vehicle_type", 30, False),
+    ("/ardupilot-manager/v1.0/firmware_vehicle_type", 30, False),
+    ("/ardupilot-manager/v1.0/board", 10, False),
+    ("/ardupilot-manager/v1.0/serials", 30, False),
+    ("/ardupilot-manager/v1.0/endpoints/", 10, False),
+    ("/ardupilot-manager/v1.0/preferred_router", 30, False),
+    ("/beacon/v1.0/services", 30, False),
+    ("/beacon/v1.0/ip", 10, False),
+    ("/beacon/v1.0/hostname", 60, False),
+    ("/beacon/v1.0/vehicle_name", 60, False),
+    ("/bridget/v1.0/bridges", 10, False),
+    ("/cable-guy/v1.0/ethernet", 10, False),
+    ("/cable-guy/v1.0/interfaces", 10, False),
+    ("/cable-guy/v1.0/host_dns", 60, False),
+    ("/commander/v1.0/environment_variables", 60, False),
+    ("/helper/latest/web_services", 30, False),
+    ("/mavlink-camera-manager/streams", 5, False),
+    ("/mavlink-camera-manager/info", 60, False),
+    ("/mavlink-camera-manager/v4l", 30, False),
+    ("/nmea-injector/v1.0/socks", 30, False),
+    ("/ping/v1.0/sensors", 10, False),
+    ("/version-chooser/v1.0/version/current/", 60, False),
+    ("/version-chooser/v1.0/bootstrap/current", 60, False),
+    ("/wifi-manager/v1.0/status", 5, False),
+    ("/wifi-manager/v1.0/hotspot", 30, False),
+]
+
+# Logs end up shared with other people, so never write anything that looks like a credential.
+SECRET_KEY = re.compile(r"pass|secret|token|credential|api_?key|private_?key", re.IGNORECASE)
+
+
+def redact(value):
+    if isinstance(value, dict):
+        return {k: "<redacted>" if SECRET_KEY.search(str(k)) else redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
+BOOTTIME = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+
+
+def linux_shift() -> int:
+    return time.time_ns() - time.monotonic_ns()
+
+
+_adjtimex = getattr(ctypes.CDLL(None), "adjtimex", None)
+
+
+def ntp_synced() -> bool | None:
+    """What `timedatectl` reports as "System clock synchronized"; None where the kernel can't say."""
+    if _adjtimex is None:
+        return None
+    timex = ctypes.create_string_buffer(512)  # zeroed, so modes = 0: read only, no privilege needed
+    state = _adjtimex(timex)
+    return None if state == -1 else state != 5  # 5 is TIME_ERROR, set while the clock is unsynchronized
+
+
+def iso(ns: int) -> str:
+    return datetime.fromtimestamp(ns / 1e9, timezone.utc).isoformat(timespec="milliseconds")
+
+
+class Clock:
+    """Maps the monotonic clock to UTC: corrected = mono + shift, like ArduPilot's rtc_shift."""
+
+    def __init__(self):
+        self.shift = self.linux = linux_shift()
+        self.source = "linux_clock"
+        self.syncs = 0
+
+
+class Recorder:
+    def __init__(self, clock: Clock):
+        self.clock = clock
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # The sequence number keeps files in recording order even when the clock that named them was wrong.
+        number = max((int(p.name[:4]) for p in LOG_DIR.glob("[0-9][0-9][0-9][0-9]_*.mcap")), default=0) + 1
+        stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+        self.path = LOG_DIR / f"{number:04d}_{stamp}.mcap"
+        self.file = open(self.path, "xb")  # never overwrite a recording
+        # ponytail: data since the last 1 MB chunk is lost on power cut; `mcap recover` salvages the rest.
+        self.writer = Writer(self.file)
+        self.writer.start(library=f"blueos-complete-data-logger/{VERSION}")
+        self.channels: dict[str, int] = {}
+        self.messages = 0
+        self.dropped = 0
+        self.paused = False
+        self.errors: dict[str, str] = {}
+        self.links: dict[str, str] = {}
+
+    def write(self, topic: str, data) -> None:
+        if self.paused:
+            self.dropped += 1
+            return
+        mono, wall = time.monotonic_ns(), time.time_ns()
+        corrected = mono + self.clock.shift
+        if topic not in self.channels:
+            self.channels[topic] = self.writer.register_channel(topic, message_encoding="json", schema_id=0)
+        envelope = {"mono_ns": mono, "wall_ns": wall, "corrected_ns": corrected, "data": data}
+        payload = json.dumps(envelope, separators=(",", ":")).encode()
+        self.writer.add_message(self.channels[topic], log_time=corrected, data=payload, publish_time=wall)
+        self.messages += 1
+
+    def event(self, text: str) -> None:
+        print(text, flush=True)
+        self.write("/logger/events", {"event": text})
+
+    def sync(self, source: str, shift: int, **extra) -> None:
+        previous = self.clock.shift
+        self.clock.shift, self.clock.source = shift, source
+        self.clock.syncs += 1
+        self.write("/time/sync", {"source": source, "shift_ns": shift, "previous_shift_ns": previous,
+                                  "step_ns": shift - previous, "boottime_ns": time.clock_gettime_ns(BOOTTIME),
+                                  "linux_ntp_synced": ntp_synced(), **extra})
+        print(f"time sync from {source}: corrected time is now {iso(time.monotonic_ns() + shift)}", flush=True)
+
+    def finish(self) -> None:
+        clock = self.clock
+        # Lets offline tools re-stamp messages recorded before the first sync: corrected = mono_ns + final_shift_ns.
+        self.writer.add_metadata("time_sync", {"final_shift_ns": str(clock.shift), "final_source": clock.source,
+                                               "sync_count": str(clock.syncs)})
+        self.writer.finish()
+        self.file.close()
+
+
+clock = Clock()
+rec: Recorder  # created in main(), after the event loop exists
+
+
+def get_json(path: str):
+    with urllib.request.urlopen(f"http://{HOST}{path}", timeout=15) as response:
+        body = response.read()
+    return json.loads(body) if body else None
+
+
+async def poll(path: str, period: float, always: bool) -> None:
+    topic = "/blueos" + path.split("?")[0].rstrip("/*")
+    last = None
+    while True:
+        started = time.monotonic()
+        try:
+            data, failed = redact(await asyncio.to_thread(get_json, path)), False
+            rec.errors.pop(path, None)
+        except Exception as error:  # a service being down is data too
+            data, failed = {"error": f"{type(error).__name__}: {error}"}, True
+            rec.errors[path] = data["error"]
+        encoded = json.dumps(data, sort_keys=True)
+        if encoded != last or (always and not failed):
+            rec.write(topic, data)
+        last = encoded
+        await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
+
+
+def autopilot_time(message: dict) -> None:
+    unix_ns = message.get("time_unix_usec", 0) * 1000
+    if unix_ns < OLDEST_VALID_NS:  # the autopilot has no time source yet
+        return
+    # ArduPilot never moves its clock backwards, so after a bad SYSTEM_TIME from a topside it can stay wrong while NTP
+    # has already fixed Linux. Trust it only while Linux has nothing better (offline, or a Pixhawk with GPS).
+    if ntp_synced():
+        return
+    shift = unix_ns - time.monotonic_ns()
+    if abs(shift - clock.shift) > AUTOPILOT_STEP_NS:
+        rec.sync("autopilot_system_time", shift, time_unix_usec=message["time_unix_usec"],
+                 time_boot_ms=message.get("time_boot_ms"))
+
+
+async def websocket(name: str, path: str, handle) -> None:
+    # Iterating connect() reconnects with backoff when the service restarts or nginx answers 5xx.
+    async for ws in websockets.connect(f"ws://{HOST}{path}", max_size=None, open_timeout=10):
+        rec.links[name] = "connected"
+        rec.event(f"{name} connected")
+        try:
+            async for raw in ws:
+                handle(json.loads(raw))
+        except websockets.ConnectionClosed:
+            pass
+        rec.links[name] = "reconnecting"
+        rec.event(f"{name} disconnected")
+
+
+def handle_mavlink(packet: dict) -> None:
+    header, message = packet["header"], packet["message"]
+    rec.write(f"/mavlink/{header['system_id']}/{header['component_id']}/{message['type']}", packet)
+    if message["type"] == "SYSTEM_TIME" and header["component_id"] == 1:
+        autopilot_time(message)
+
+
+last_kernel_sequence = -1
+
+
+def handle_kernel(messages: list) -> None:
+    # The service sends the whole ring buffer on every connection, so skip what was already recorded.
+    global last_kernel_sequence
+    for message in messages:
+        if message["sequence_number"] > last_kernel_sequence:
+            last_kernel_sequence = message["sequence_number"]
+            rec.write("/linux/kernel", message)
+
+
+def on_linux_clock_set() -> None:
+    # The record nothing on BlueOS keeps today: old time, new time and monotonic time of every step.
+    shift = linux_shift()
+    previous, clock.linux = clock.linux, shift
+    synced = ntp_synced()
+    rec.write("/time/linux_clock_set", {"shift_ns": shift, "previous_shift_ns": previous, "step_ns": shift - previous,
+                                        "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": synced})
+    # An unsynchronized Linux clock does not override a valid autopilot time (see autopilot_time).
+    if clock.source == "linux_clock" or synced:
+        rec.sync("linux_clock", shift)
+
+
+async def watch_linux_clock() -> None:
+    """Records every set of the Linux clock, of any size, from any caller. Slewing is not a set and is not recorded."""
+    if not hasattr(os, "timerfd_create"):
+        rec.event("clock step detection needs Linux and Python 3.13, not recording Linux clock steps")
+        return
+    loop = asyncio.get_running_loop()
+    fd = os.timerfd_create(time.CLOCK_REALTIME, flags=os.TFD_NONBLOCK | os.TFD_CLOEXEC)
+
+    def arm() -> None:
+        # The kernel cancels this timer whenever CLOCK_REALTIME is set. A year ahead keeps it inside 32-bit time_t.
+        os.timerfd_settime_ns(fd, flags=os.TFD_TIMER_ABSTIME | os.TFD_TIMER_CANCEL_ON_SET,
+                              initial=time.time_ns() + 365 * 86400 * 10**9)
+
+    def on_ready() -> None:
+        try:
+            os.read(fd, 8)  # only returns if a whole year went by without a clock set
+        except OSError as error:
+            if error.errno == errno.ECANCELED:
+                on_linux_clock_set()
+            elif error.errno != errno.EAGAIN:
+                raise
+        arm()
+
+    arm()
+    loop.add_reader(fd, on_ready)
+    try:
+        synced = None
+        while True:  # the NTP state is what decides whether the autopilot's time is trusted, so keep it in the log
+            if (now := ntp_synced()) != synced:
+                synced = now
+                rec.write("/time/linux_ntp", {"synced": synced})
+                if synced and clock.source != "linux_clock":  # NTP outranks the autopilot, even if it got there by slew
+                    rec.sync("linux_clock", linux_shift())
+            await asyncio.sleep(1)
+    finally:
+        loop.remove_reader(fd)
+        os.close(fd)
+
+
+def read_new_lines(path: Path, state: list, backfill: bool) -> None:
+    offset, partial = state
+    if path.stat().st_size < offset:  # truncated in place
+        offset = 0
+    with path.open("rb") as file:
+        file.seek(offset)
+        chunk = file.read(4 * 2**20)
+    lines = (partial + chunk).split(b"\n")
+    state[:] = [offset + len(chunk), lines.pop()]
+    for line in lines:
+        if line.strip():
+            rec.write(f"/blueos/logs/{path.parent.name}",
+                      {"line": line.decode(errors="replace"), "file": path.name, "backfill": backfill})
+
+
+async def tail_service_logs() -> None:
+    # Every file is followed, not just the newest: log files are named and dated by the wall clock, so after a
+    # backward step the file being written can look older than the one before it.
+    boot_wall = time.time() - time.clock_gettime(BOOTTIME)
+    tails: dict[Path, list] = {}  # file -> [offset, partial line]
+    first_scan = True
+    while True:
+        if SERVICE_LOGS.is_dir():
+            seen = set()
+            for path in SERVICE_LOGS.glob("*/*"):
+                try:
+                    if path.suffix == ".zip" or not path.is_file():
+                        continue
+                    seen.add(path)
+                    if path not in tails:
+                        # At start, read whole only what was written since boot, so the boot sequence is in the log.
+                        # Files that show up later are new rotations, read whole.
+                        whole = not first_scan or path.stat().st_mtime > boot_wall
+                        tails[path] = [0 if whole else path.stat().st_size, b""]
+                    read_new_lines(path, tails[path], backfill=first_scan)
+                except OSError:  # zipped away mid-scan
+                    continue
+            for gone in tails.keys() - seen:
+                del tails[gone]
+            first_scan = False
+        await asyncio.sleep(1)
+
+
+async def watch_disk() -> None:
+    while True:
+        paused = shutil.disk_usage(LOG_DIR).free < MIN_FREE_BYTES
+        if paused and not rec.paused:
+            rec.event(f"recording paused: less than {MIN_FREE_BYTES // 2**20} MB free")
+            rec.paused = True
+        elif rec.paused and not paused:
+            rec.paused = False
+            rec.event(f"recording resumed after dropping {rec.dropped} messages")
+        await asyncio.sleep(10)
+
+
+async def supervise(name: str, run) -> None:
+    while True:
+        try:
+            await run()
+            return  # finished on purpose
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # a bug in one source must not stop the others from recording
+            rec.event(f"{name} crashed, restarting: {error!r}")
+            await asyncio.sleep(5)
+
+
+REGISTER_SERVICE = {
+    "name": "Complete Data Logger",
+    "description": "Records MAVLink, BlueOS services, kernel and service logs into one MCAP file",
+    "icon": "mdi-database-clock",
+    "company": "Blue Robotics",
+    "version": VERSION,
+    "webpage": "https://github.com/rafaellehmkuhl/blueos-complete-data-logger",
+    "api": "",
+}
+
+
+def status() -> dict:
+    mono = time.monotonic_ns()
+    return {
+        "file": rec.path.name,
+        "messages": rec.messages,
+        "topics": len(rec.channels),
+        "paused": rec.paused,
+        "dropped": rec.dropped,
+        "links": rec.links,
+        "failing_endpoints": rec.errors,
+        "time": {"source": clock.source, "syncs": clock.syncs, "corrected": iso(mono + clock.shift),
+                 "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
+    }
+
+
+def page() -> str:
+    s = status()
+    rows = "".join(
+        f"<tr><td>{escape(p.name)}{' (recording)' if p == rec.path else ''}</td>"
+        f"<td>{p.stat().st_size / 2**20:.1f} MB</td>"
+        f"<td><a href='download/{quote(p.name)}'>Download</a></td>"
+        + ("<td></td></tr>" if p == rec.path else
+           f"<td><form method='post' action='delete/{quote(p.name)}'>"
+           f"<button aria-label='Delete {escape(p.name)}'>Delete</button></form></td></tr>")
+        for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True)
+    )
+    failing = "".join(f"<li>{escape(k)}: {escape(v)}</li>" for k, v in s["failing_endpoints"].items()) or "<li>None</li>"
+    state = "Paused, disk almost full" if s["paused"] else "Recording"
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Complete Data Logger</title>
+<style>body{{font-family:system-ui,sans-serif;margin:16px;max-width:900px}}table{{border-collapse:collapse;width:100%}}
+td,th{{padding:6px 8px;border-bottom:1px solid #8884;text-align:left}}form{{margin:0}}</style></head><body>
+<h1>Complete Data Logger</h1>
+<p><strong>{state}</strong> to {escape(s['file'])}: {s['messages']} messages on {s['topics']} topics,
+{s['dropped']} dropped.</p>
+<p>Time source: {escape(s['time']['source'])} ({s['time']['syncs']} syncs). Corrected time {s['time']['corrected']},
+Linux time {s['time']['linux']} (NTP synchronized: {s['time']['linux_ntp_synced']}).</p>
+<p>Streams: {escape(', '.join(f'{k} {v}' for k, v in s['links'].items()) or 'connecting')}</p>
+<h2>Failing endpoints</h2><ul>{failing}</ul>
+<h2>Recordings</h2><table><thead><tr><th>File</th><th>Size</th><th></th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args) -> None:
+        pass
+
+    def reply(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def recording(self, prefix: str) -> Path | None:
+        # Only names that are listed in the folder, so a crafted path can never leave it.
+        name = unquote(urlparse(self.path).path.removeprefix(prefix))
+        return next((p for p in LOG_DIR.glob("*.mcap") if p.name == name), None)
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/register_service":
+            self.reply(200, json.dumps(REGISTER_SERVICE).encode(), "application/json")
+        elif path == "/status":
+            self.reply(200, json.dumps(status()).encode(), "application/json")
+        elif path.startswith("/download/") and (file := self.recording("/download/")):
+            size = file.stat().st_size  # the active file keeps growing, so send a snapshot
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{file.name}"')
+            self.end_headers()
+            with file.open("rb") as f:
+                while size > 0 and (chunk := f.read(min(2**20, size))):
+                    self.wfile.write(chunk)
+                    size -= len(chunk)
+        elif path == "/":
+            self.reply(200, page().encode(), "text/html; charset=utf-8")
+        else:
+            self.reply(404, b"Not found", "text/plain")
+
+    def do_POST(self) -> None:
+        file = self.recording("/delete/")
+        if file is None or file == rec.path:
+            self.reply(404, b"No such finished recording", "text/plain")
+            return
+        file.unlink()
+        self.send_response(303)
+        self.send_header("Location", "../")
+        self.end_headers()
+
+
+async def main() -> None:
+    global rec
+    rec = Recorder(clock)
+    rec.writer.add_metadata("recording", {
+        "extension_version": VERSION,
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if Path("/proc/sys/kernel/random/boot_id").exists() else "unknown",
+        "start_mono_ns": str(time.monotonic_ns()),
+        "start_wall_ns": str(time.time_ns()),
+    })
+    rec.sync("linux_clock", clock.linux)  # the reference at start
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Recording to {rec.path}, web interface on port {PORT}", flush=True)
+
+    sources = {f"poll {path}": (lambda p=path, s=period, a=always: poll(p, s, a)) for path, period, always in POLLS}
+    sources["mavlink2rest"] = lambda: websocket("mavlink2rest", "/mavlink2rest/ws/mavlink?filter=.*", handle_mavlink)
+    sources["kernel"] = lambda: websocket("kernel", "/system-information/ws/kernel_buffer", handle_kernel)
+    sources["linux clock"] = watch_linux_clock
+    sources["service logs"] = tail_service_logs
+    sources["disk"] = watch_disk
+    tasks = [asyncio.create_task(supervise(name, run)) for name, run in sources.items()]
+
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+    await stop.wait()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    rec.event("recording stopped")
+    rec.finish()
+    server.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
