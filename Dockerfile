@@ -7,7 +7,8 @@ ENV VERSION=${VERSION}
 LABEL version="${VERSION}"
 LABEL permissions='{\
   "ExposedPorts": {\
-    "9650/tcp": {}\
+    "9650/tcp": {},\
+    "9651/tcp": {}\
   },\
   "HostConfig": {\
     "NetworkMode": "host",\

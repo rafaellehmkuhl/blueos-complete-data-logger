@@ -39,15 +39,29 @@ def test() -> None:
     with log.open("ab") as f:
         f.write(b"ond\n")
     main.read_new_lines(log, state, backfill=False)
+
+    # Another extension logging through the ingest API.
+    client = {"name": "unnamed"}
+    assert main.ingest(client, {"op": "hello", "name": "My Ext!"}) is None and client["name"] == "My_Ext"
+    reply = main.ingest(client, {"op": "sync", "t0": 5})
+    assert reply["t0"] == 5 and reply["corrected_ns"] - reply["mono_ns"] == main.clock.shift
+    happened = main.time.monotonic_ns() - 10**9
+    assert main.ingest(client, {"op": "log", "topic": "../time/sync", "data": {"depth": 3}, "mono_ns": happened}) is None
+    assert main.ingest(client, {"op": "log", "topic": "x", "mono_ns": main.time.monotonic_ns() + 5 * 10**9})["op"] == "error"
+    assert main.ingest(client, {"op": "log", "topic": "//"})["op"] == "error"
     main.rec.finish()
 
     raw = messages(main.rec.path.read_bytes())
     a = [e for topic, _, e in raw if topic == "/a"]
     assert [e["time_synced_externally"] for e in a] == [False, True]
     assert a[1]["corrected_ns"] - a[1]["mono_ns"] - (a[0]["corrected_ns"] - a[0]["mono_ns"]) == HOUR
-    log_times = [t for _, t, _ in raw]
-    assert log_times == sorted(log_times), "the recorded file must never jump back"
+    # The recorded log_time never jumps when the reference changes: it is mono_ns plus one constant.
+    assert len({t - e["mono_ns"] for _, t, e in raw}) == 1
     assert [e["data"]["line"] for topic, _, e in raw if topic == "/blueos/logs/svc"] == ["first", "second"]
+
+    ext = [e for topic, _, e in raw if topic == "/extensions/My_Ext/time/sync"]
+    assert len(ext) == 1 and ext[0]["mono_ns"] == happened and ext[0]["received_mono_ns"] > happened
+    assert sum(topic == "/time/sync" for topic, _, _ in raw) == 1, "a client can't write into /time"
 
     out = io.BytesIO()
     main.export(main.rec.path, out)

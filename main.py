@@ -38,6 +38,7 @@ from mcap.writer import Writer
 VERSION = os.environ.get("VERSION", "0.0.0")
 HOST = os.environ.get("BLUEOS_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "9650"))
+INGEST_PORT = int(os.environ.get("INGEST_PORT", "9651"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
 SERVICE_LOGS = Path(os.environ.get("SERVICE_LOGS", "/var/logs/blueos/services"))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_MB", "1024")) * 2**20
@@ -168,15 +169,23 @@ class Recorder:
         self.errors: dict[str, str] = {}
         self.links: dict[str, str] = {}
 
-    def write(self, topic: str, data) -> None:
+    def write(self, topic: str, data, mono: int | None = None) -> None:
+        """Records `data` as happening now, or at `mono` (our CLOCK_MONOTONIC) when the sender stamped it."""
         if self.paused:
             self.dropped += 1
             return
-        mono, wall = time.monotonic_ns(), time.time_ns()
+        now, wall = time.monotonic_ns(), time.time_ns()
+        extra = {}
+        if mono is None:
+            mono = now
+        else:
+            wall -= now - mono  # what Linux believed when it happened
+            extra["received_mono_ns"] = now
         if topic not in self.channels:
             self.channels[topic] = self.writer.register_channel(topic, message_encoding="json", schema_id=0)
         envelope = {"mono_ns": mono, "wall_ns": wall, "corrected_ns": mono + self.clock.shift,
-                    "time_synced_externally": self.clock.synced, "time_source": self.clock.source, "data": data}
+                    "time_synced_externally": self.clock.synced, "time_source": self.clock.source, **extra,
+                    "data": data}
         payload = json.dumps(envelope, separators=(",", ":")).encode()
         # MCAP readers sort by log_time, so it must never jump: monotonic time placed at the wall time of the start.
         log_time = mono + self.clock.start_shift
@@ -506,6 +515,58 @@ def export(path: Path, out) -> None:
     writer.finish()
 
 
+TOPIC_PART = re.compile(r"[^A-Za-z0-9_.-]+")
+MAX_FUTURE_NS = 1_000_000_000  # a sender's sync can be off by about its round trip, never by a second
+
+
+def time_info() -> dict:
+    mono = time.monotonic_ns()
+    return {"mono_ns": mono, "corrected_ns": mono + clock.shift, "shift_ns": clock.shift,
+            "time_synced_externally": clock.synced, "time_source": clock.source}
+
+
+def ingest(state: dict, message) -> dict | None:
+    """One message from another service or extension. Returns the reply to send, if any."""
+    if not isinstance(message, dict):
+        return {"op": "error", "error": "expected a JSON object"}
+    op = message.get("op")
+    if op == "hello":
+        state["name"] = TOPIC_PART.sub("_", str(message.get("name", ""))).strip("_")[:64] or "unnamed"
+        rec.event(f"client {state['name']} connected")
+        return None
+    if op == "sync":
+        return {"op": "sync", "t0": message.get("t0"), **time_info()}
+    if op == "log":
+        topic, mono = message.get("topic"), message.get("mono_ns")
+        parts = [TOPIC_PART.sub("_", part) for part in topic.split("/") if part.strip(".")] if isinstance(topic, str) else []
+        if not parts:
+            return {"op": "error", "error": "log needs a topic"}
+        if mono is not None and (type(mono) is not int or not 0 < mono <= time.monotonic_ns() + MAX_FUTURE_NS):
+            return {"op": "error", "error": "mono_ns must be our CLOCK_MONOTONIC in ns, from a sync, not in the future"}
+        # Always under the sender's own namespace, so nobody can write into /time or /mavlink.
+        rec.write(f"/extensions/{state['name']}/{'/'.join(parts)[:200]}", message.get("data"), mono=mono)
+        return None
+    return {"op": "error", "error": f"unknown op {op!r}, expected hello, sync or log"}
+
+
+async def serve_ingest() -> None:
+    async def client(ws) -> None:
+        state = {"name": "unnamed"}
+        try:
+            async for raw in ws:
+                try:
+                    reply = ingest(state, json.loads(raw))
+                except ValueError:
+                    reply = {"op": "error", "error": "invalid JSON"}
+                if reply:
+                    await ws.send(json.dumps(reply))
+        finally:
+            rec.event(f"client {state['name']} disconnected")
+
+    async with websockets.serve(client, "0.0.0.0", INGEST_PORT, max_size=2**20):
+        await asyncio.Future()
+
+
 async def watch_disk() -> None:
     while True:
         paused = shutil.disk_usage(LOG_DIR).free < MIN_FREE_BYTES
@@ -662,6 +723,7 @@ async def main() -> None:
     sources["linux clock"] = watch_linux_clock
     sources["service logs"] = tail_service_logs
     sources["container logs"] = follow_container_logs
+    sources["ingest"] = serve_ingest
     sources["disk"] = watch_disk
     tasks = [asyncio.create_task(supervise(name, run)) for name, run in sources.items()]
 

@@ -65,9 +65,29 @@ Recording pauses while less than 1 GB is free and resumes on its own. An hour ta
 
 If the vehicle loses power, the file has no index and the last chunk (up to 1 MB) is lost. `mcap recover <file>` rebuilds the rest.
 
+## Logging from other services and extensions
+
+Any service can add its own data to the recording, with the same synchronized time, over a WebSocket on port `9651` (`ws://blueos.local:9651`). Messages are JSON objects with an `op`:
+
+| `op` | Send | Reply |
+|---|---|---|
+| `hello` | `{"op": "hello", "name": "my-extension"}` | none. Names your topics; send it first. |
+| `sync` | `{"op": "sync", "t0": <your clock, ns>}` | `{"op": "sync", "t0", "mono_ns", "corrected_ns", "shift_ns", "time_synced_externally", "time_source"}` |
+| `log` | `{"op": "log", "topic": "sonar/depth", "data": {...}, "mono_ns": <our monotonic, ns>}` | none, or an `error` |
+
+Stamp each message with **our** monotonic time, at the moment it happened, not when you send it:
+
+1. Sync: send `t0` (your monotonic clock), get our `mono_ns`, note the arrival time `t2`. Then `offset = mono_ns - (t0 + t2) / 2`, and the round trip `t2 - t0` bounds the error. Repeat a few times and keep the shortest round trip.
+2. Log with `mono_ns = your monotonic time when it happened + offset`. Leave `mono_ns` out and the time of arrival is used instead.
+3. Re-sync now and then: two monotonic clocks drift apart slowly.
+
+Monotonic, not corrected time, because it never jumps: whatever happens to the clocks later, the logger maps it to UTC on download like everything else. An extension on the same vehicle shares the kernel's monotonic clock (Docker gives containers no offset), so its offset comes out near zero; the sync still guards against a container with a time namespace offset, and it is what makes a service on another computer, like the topside, work too.
+
+Messages land on `/extensions/<name>/<topic>`, with `received_mono_ns` next to `mono_ns`; a client can't write outside its own namespace. `mono_ns` in the future (beyond one second) is refused. `example_client.py` does all of this in about 40 lines.
+
 ## Settings
 
-Environment variables, all optional: `MIN_FREE_MB` (default `1024`), `PORT` (`9650`), `BLUEOS_HOST` (`127.0.0.1`, change it to run the logger off-vehicle).
+Environment variables, all optional: `MIN_FREE_MB` (default `1024`), `PORT` (`9650`), `INGEST_PORT` (`9651`), `BLUEOS_HOST` (`127.0.0.1`, change it to run the logger off-vehicle).
 
 ## Development
 
