@@ -44,10 +44,10 @@ LABEL requirements="core >= 1.4"
 WORKDIR /app
 
 COPY requirements.txt .
-# zstandard and lz4 ship no armv7 wheels, so the compiler is needed there (and removed in the same layer).
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+# zstandard, lz4 and cffi ship no armv7 wheels, so the compiler is needed there (and removed in the same layer).
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libffi-dev \
     && pip install --no-cache-dir -r requirements.txt \
-    && apt-get purge -y gcc libc6-dev && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+    && apt-get purge -y gcc libc6-dev libffi-dev && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 COPY main.py .
 
