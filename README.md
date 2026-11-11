@@ -6,6 +6,16 @@ Targets BlueOS 1.4.x. Video streams are not recorded, only their configuration.
 
 ![The extension page: live message rate, the corrected UTC clock and whether it is synchronized externally, source connections, and the recordings with their downloads](docs/screenshot.jpg)
 
+## Highlights
+
+- **Everything in one file.** Every MAVLink message from every component, the state of every BlueOS service, kernel messages, the BlueOS service logs and the logs of every container, extensions included, side by side on one timeline.
+- **Time you can trust, and know when not to.** Every message carries the monotonic time it arrived, which never jumps, so relative timing is always right. It also carries a `time_synced_externally` flag that says whether its absolute UTC time comes from NTP or the autopilot, or only from the vehicle's own clock. Each clock change is recorded with its exact step.
+- **Synchronized after the fact.** Download re-stamps the whole run with the best time reference it reached, including what was recorded before the clock was synced.
+- **No more space than it needs.** Large state, like the bag of holding, is written only when it changes, and small recurring data, like CPU and temperature, is written every poll. The file is compressed. The page shows how fast the file grows and how long until the disk limit; recording pauses at 95% disk use so the vehicle never runs out of space.
+- **Other services can log into it.** Any extension or topside service can send its own data over a WebSocket, synced to the same clock, and it lands in the same file.
+- **Record what matters.** Start a new file the moment the useful part begins, and set how often each service is polled.
+- **Safe for the vehicle.** It only reads from BlueOS, a power cut loses at most the last chunk, and a clock step can't crash it or reorder its data.
+
 ## What is recorded
 
 | Topic | Source | When |
