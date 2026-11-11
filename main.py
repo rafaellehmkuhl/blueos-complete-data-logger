@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import quote, unquote, urlparse
 
 import websockets
@@ -168,8 +168,13 @@ class Recorder:
         self.paused = False
         self.errors: dict[str, str] = {}
         self.links: dict[str, str] = {}
+        self.lock = Lock()  # the container log threads write directly, so a backlog can't starve the event loop
 
     def write(self, topic: str, data, mono: int | None = None) -> None:
+        with self.lock:
+            self._write(topic, data, mono)
+
+    def _write(self, topic: str, data, mono: int | None) -> None:
         """Records `data` as happening now, or at `mono` (our CLOCK_MONOTONIC) when the sender stamped it."""
         if self.paused:
             self.dropped += 1
@@ -211,9 +216,11 @@ class Recorder:
 
     def finish(self) -> None:
         # The reference export() applies to the whole file: corrected = mono_ns + shift_ns.
-        self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
-        self.writer.finish()
-        self.file.close()
+        with self.lock:
+            self.paused = True  # threads still running get dropped from here on
+            self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
+            self.writer.finish()
+            self.file.close()
 
 
 clock = Clock()
@@ -392,7 +399,7 @@ def parse_docker_line(line: str) -> tuple[str, int | None]:
         return line, None
 
 
-def follow_container(loop, container: dict, since_ns: int, backfill_until_ns: int, last_seen: dict) -> None:
+def follow_container(container: dict, since_ns: int, backfill_until_ns: int, last_seen: dict) -> None:
     """Runs in its own thread until the container stops: a log stream can stay silent for hours."""
     name = container["Names"][0].lstrip("/")
     base = f"http://{HOST}/docker/containers/{container['Id']}"
@@ -417,7 +424,7 @@ def follow_container(loop, container: dict, since_ns: int, backfill_until_ns: in
                     last_seen[name] = docker_ns
                 data = {"line": text, "stream": stream, "docker_time_ns": docker_ns,
                         "backfill": docker_ns is not None and docker_ns < backfill_until_ns}
-                loop.call_soon_threadsafe(rec.write, f"/docker/logs/{name}", data)
+                rec.write(f"/docker/logs/{name}", data)
 
 
 async def follow_container_logs() -> None:
@@ -440,7 +447,7 @@ async def follow_container_logs() -> None:
             if name not in threads or not threads[name].is_alive():
                 since = last_seen[name] + 1 if name in last_seen else boot_ns
                 threads[name] = Thread(target=follow_container, daemon=True,
-                                       args=(loop, container, since, started_ns, last_seen))
+                                       args=(container, since, started_ns, last_seen))
                 threads[name].start()
         await asyncio.sleep(10)
 
@@ -632,7 +639,7 @@ def page() -> str:
     state = "Paused, disk almost full" if s["paused"] else "Recording"
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Complete Data Logger</title>
-<style>body{{font-family:system-ui,sans-serif;margin:16px;max-width:900px}}table{{border-collapse:collapse;width:100%}}
+<style>:root{{color-scheme:light dark}}body{{font-family:system-ui,sans-serif;margin:16px;max-width:900px;background:Canvas;color:CanvasText}}table{{border-collapse:collapse;width:100%}}
 td,th{{padding:6px 8px;border-bottom:1px solid #8884;text-align:left}}form{{margin:0}}</style></head><body>
 <h1>Complete Data Logger</h1>
 <p><strong>{state}</strong> to {escape(s['file'])}: {s['messages']} messages on {s['topics']} topics,
