@@ -117,7 +117,7 @@
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   /* Widths follow what each tile can hold: messages grows to 10 digits, topics and dropped stay at 4 characters. */
-  .stats { display: grid; grid-template-columns: 1.75fr 1.05fr 1.3fr minmax(64px, .85fr) minmax(64px, .85fr); gap: 10px; }
+  .stats { display: grid; grid-template-columns: 2.3fr 1fr 1.25fr minmax(60px, .7fr) minmax(60px, .7fr); gap: 10px; }
   @media (max-width: 1000px) and (min-width: 821px), (max-width: 560px) { .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .stat { padding: 12px 4px; border-radius: 10px; background: var(--surface-2); text-align: center; min-width: 0; }
   .stat .value { display: block; font-size: 22px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
