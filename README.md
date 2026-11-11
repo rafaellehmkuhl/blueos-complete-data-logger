@@ -4,6 +4,8 @@ A BlueOS extension that records everything the vehicle knows about itself into o
 
 Targets BlueOS 1.4.x. Video streams are not recorded, only their configuration.
 
+![The extension page: live message rate, the corrected UTC clock and whether it is synchronized externally, source connections, and the recordings with their downloads](docs/screenshot.jpg)
+
 ## What is recorded
 
 | Topic | Source | When |
