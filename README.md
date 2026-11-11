@@ -59,7 +59,9 @@ Nothing in the logger reads the wall clock to measure time or name files it depe
 
 ## Using it
 
-The extension page lists recordings with their size, lets you download them synchronized or raw (the active one too, up to its last written chunk) and delete finished ones. It also shows whether the time is synchronized externally, its source, and any endpoint that is failing. Files live in `/usr/blueos/extensions/complete-data-logger` on the vehicle and are numbered, so their order holds even when the clock that named them was wrong.
+The extension page shows the recording live (message rate, topics, the corrected UTC clock, whether the time is synchronized externally and from which source, and any endpoint that is failing) and lists recordings, which you can download synchronized or raw (the active one too, up to its last written chunk) or delete once finished.
+
+**New file** closes the current file and continues in a new one from that moment, so a recording can start where the useful data does, with nothing to trim. The new file is complete on its own: it starts with the time reference in use, so it is synchronized from its first message if the vehicle already was, and the state of every service is written again at its start. The same is available as `POST /new_file`. Files live in `/usr/blueos/extensions/complete-data-logger` on the vehicle and are numbered, so their order holds even when the clock that named them was wrong.
 
 Recording pauses while less than 1 GB is free and resumes on its own. An hour takes roughly 50 MB.
 

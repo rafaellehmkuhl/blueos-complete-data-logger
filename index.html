@@ -104,6 +104,10 @@
     display: flex; align-items: center; gap: 8px; margin: 0 0 14px;
     font-size: 12px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
   }
+  .new-file { margin-inline-start: auto; padding: 6px 12px; text-transform: none; letter-spacing: 0; }
+  .new-file.busy svg { animation: spin .8s linear infinite; }
+  .new-file.done { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .info {
     display: inline-grid; place-items: center; width: 18px; height: 18px; padding: 0; border-radius: 50%;
     border: 1px solid var(--border); background: transparent; color: var(--muted);
@@ -248,7 +252,12 @@
     <section class="card span-7" aria-labelledby="h-now">
       <h2 id="h-now">Now recording
         <button class="info" type="button" aria-label="About this recording"
-                data-tip="&lt;strong&gt;One file per run&lt;/strong&gt;Every MAVLink message, BlueOS service state, kernel message, service log and container log goes into this one MCAP file. A new file starts every time the extension starts.">i</button>
+                data-tip="&lt;strong&gt;One file per run&lt;/strong&gt;Every MAVLink message, BlueOS service state, kernel message, service log and container log goes into this one MCAP file. A new file starts every time the extension starts, or when you start one.">i</button>
+        <button class="btn new-file" id="new-file" type="button"
+                data-tip="&lt;strong&gt;Start a new file from now&lt;/strong&gt;Closes the current file, which stays in the list below, and continues in a new one, so your recording begins where the useful data does, with nothing to trim. The time synchronization carries over, and the current state of every service is written again at the start.">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M12 12v6m-3-3h6"/></svg>
+          <span>New file</span>
+        </button>
       </h2>
       <div class="stats">
         <div class="stat" data-tip="Messages written to the current file since it started."><span class="value num" id="messages">–</span><span class="label">messages</span></div>
@@ -488,6 +497,24 @@ $("recs").addEventListener("click", async (e) => {
   hideTip();
   await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST" });
   refresh();
+});
+
+$("new-file").addEventListener("click", async (e) => {
+  const btn = e.currentTarget, label = btn.querySelector("span");
+  if (btn.classList.contains("busy")) return;
+  btn.classList.add("busy");
+  hideTip();
+  try {
+    const response = await fetch("new_file", { method: "POST" });
+    if (!response.ok) throw new Error(response.statusText);
+    btn.classList.replace("busy", "done");
+    label.textContent = "Started";
+    await refresh();
+  } catch {
+    btn.classList.remove("busy");
+    label.textContent = "Failed, try again";
+  }
+  setTimeout(() => { btn.classList.remove("busy", "done"); label.textContent = "New file"; }, 2000);
 });
 
 let last = null;

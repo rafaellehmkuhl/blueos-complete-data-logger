@@ -70,6 +70,21 @@ def test() -> None:
     for _, log_time, envelope in synced:  # every message, also the one before the sync, gets the final reference
         assert envelope["time_synced_externally"] and envelope["time_source"] == "autopilot"
         assert log_time == envelope["corrected_ns"] == envelope["mono_ns"] + main.clock.shift
+
+    # A new file on request: the old one is closed whole, the new one is synchronized from its first message.
+    main.rec = main.Recorder(main.clock)
+    main.rec.start()
+    main.rec.write("/a", {"v": 3})
+    generation = main.rec.generation
+    finished = main.rec.rotate()
+    main.rec.write("/a", {"v": 4})
+    main.rec.finish()
+    assert main.rec.generation == generation + 1 and main.rec.path != finished
+    old = messages(finished.read_bytes())  # readable as a finished file, with its summary
+    assert [e["data"]["v"] for topic, _, e in old if topic == "/a"] == [3]
+    new = messages(main.rec.path.read_bytes())
+    assert new[0][0] == "/time/sync" and new[0][2]["data"]["file_start"] and new[0][2]["time_synced_externally"]
+    assert [e["data"]["v"] for topic, _, e in new if topic == "/a"] == [4]
     print("ok")
 
 

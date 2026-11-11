@@ -152,6 +152,15 @@ class Clock:
 class Recorder:
     def __init__(self, clock: Clock):
         self.clock = clock
+        self.generation = 0  # bumped with every new file, so sources that write on change write their state again
+        self._open()
+        self.dropped = 0
+        self.paused = False
+        self.errors: dict[str, str] = {}
+        self.links: dict[str, str] = {}
+        self.lock = Lock()  # the container log threads write directly, so a backlog can't starve the event loop
+
+    def _open(self) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         # The sequence number keeps files in recording order even when the clock that named them was wrong.
         number = max((int(p.name[:4]) for p in LOG_DIR.glob("[0-9][0-9][0-9][0-9]_*.mcap")), default=0) + 1
@@ -163,11 +172,33 @@ class Recorder:
         self.writer.start(library=f"blueos-complete-data-logger/{VERSION}")
         self.channels: dict[str, int] = {}
         self.messages = 0
-        self.dropped = 0
-        self.paused = False
-        self.errors: dict[str, str] = {}
-        self.links: dict[str, str] = {}
-        self.lock = Lock()  # the container log threads write directly, so a backlog can't starve the event loop
+        self.generation += 1
+
+    def start(self) -> None:
+        """Opens the file with what a reader needs to place it in time on its own."""
+        boot_id = Path("/proc/sys/kernel/random/boot_id")
+        self.writer.add_metadata("recording", {
+            "extension_version": VERSION,
+            "boot_id": boot_id.read_text().strip() if boot_id.exists() else "unknown",
+            "start_mono_ns": str(time.monotonic_ns()),
+            "start_wall_ns": str(time.time_ns()),
+        })
+        # The reference in use, so a file started after the sync is synchronized from its first message.
+        self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": self.clock.shift, "step_ns": 0,
+                                  "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": ntp_synced(),
+                                  "file_start": True})
+
+    def rotate(self) -> Path:
+        """Closes the current file and starts the next one, without losing or misplacing a message. Returns the
+        finished file."""
+        finished = self.path
+        self.event("closing this file, recording continues in the next one")
+        with self.lock:
+            self._close()
+            self._open()
+        self.start()
+        self.event(f"started after {finished.name}")
+        return finished
 
     def write(self, topic: str, data, mono: int | None = None) -> None:
         with self.lock:
@@ -217,9 +248,12 @@ class Recorder:
         # The reference export() applies to the whole file: corrected = mono_ns + shift_ns.
         with self.lock:
             self.paused = True  # threads still running get dropped from here on
-            self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
-            self.writer.finish()
-            self.file.close()
+            self._close()
+
+    def _close(self) -> None:
+        self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
+        self.writer.finish()
+        self.file.close()
 
 
 clock = Clock()
@@ -234,9 +268,11 @@ def get_json(path: str):
 
 async def poll(path: str, period: float, always: bool) -> None:
     topic = "/blueos" + path.split("?")[0].rstrip("/*")
-    last = None
+    last, generation = None, rec.generation
     while True:
         started = time.monotonic()
+        if generation != rec.generation:  # a new file: write the current state even if it didn't change
+            last, generation = None, rec.generation
         try:
             data, failed = redact(await asyncio.to_thread(get_json, path)), False
             rec.errors.pop(path, None)
@@ -330,8 +366,10 @@ async def watch_linux_clock() -> None:
     arm()
     loop.add_reader(fd, on_ready)
     try:
-        synced = None
+        synced, generation = None, rec.generation
         while True:
+            if generation != rec.generation:
+                synced, generation = None, rec.generation
             if (now := ntp_synced()) != synced:
                 synced = now
                 rec.write("/time/linux_ntp", {"synced": synced})
@@ -677,6 +715,10 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not found", "text/plain")
 
     def do_POST(self) -> None:
+        if urlparse(self.path).path == "/new_file":
+            finished = rec.rotate()
+            self.reply(200, json.dumps({"finished": finished.name, "file": rec.path.name}).encode(), "application/json")
+            return
         file = self.recording("/delete/")
         if file is None or file == rec.path:
             self.reply(404, b"No such finished recording", "text/plain")
@@ -689,14 +731,7 @@ class Handler(BaseHTTPRequestHandler):
 async def main() -> None:
     global rec
     rec = Recorder(clock)
-    rec.writer.add_metadata("recording", {
-        "extension_version": VERSION,
-        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        if Path("/proc/sys/kernel/random/boot_id").exists() else "unknown",
-        "start_mono_ns": str(time.monotonic_ns()),
-        "start_wall_ns": str(time.time_ns()),
-    })
-    rec.sync(clock.source, clock.shift)  # the reference at start
+    rec.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     print(f"Recording to {rec.path}, web interface on port {PORT}", flush=True)
