@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """BlueOS Complete Data Logger.
 
-Records MAVLink, BlueOS service state, kernel messages and BlueOS service logs into one MCAP file per run.
-Every message carries three times, mirroring how ArduPilot logs time (TimeUS + RTC records):
-  mono_ns       CLOCK_MONOTONIC when the message arrived. Never jumps; resets on reboot.
-  wall_ns       CLOCK_REALTIME when the message arrived, i.e. what Linux believed the time was.
-  corrected_ns  mono_ns + the shift from the latest time sync. This is also the MCAP log_time.
-Every time sync is recorded on /time/sync, so any time can be recomputed afterwards.
+Records MAVLink, BlueOS service state, kernel messages, BlueOS service logs and container logs into one MCAP file
+per run. Every message is wrapped as:
+  mono_ns                 CLOCK_MONOTONIC when the message arrived. Never jumps; resets on reboot.
+  wall_ns                 CLOCK_REALTIME when the message arrived, i.e. what Linux believed the time was.
+  corrected_ns            mono_ns + shift, the best UTC estimate (like ArduPilot's TimeUS + rtc_shift).
+  time_synced_externally  whether that estimate comes from an external source (NTP or the autopilot's clock).
+  time_source             ntp, autopilot or linux_unsynced.
+The file on disk uses mono_ns + the shift at start as MCAP log_time, so it never jumps and never reorders. Downloading
+it re-stamps every message with the best reference of the whole run, which also fixes what came before a sync.
 """
 
 import asyncio
@@ -27,6 +30,9 @@ from threading import Thread
 from urllib.parse import quote, unquote, urlparse
 
 import websockets
+from mcap.reader import make_reader
+from mcap.records import Channel, Message, Metadata
+from mcap.stream_reader import StreamReader
 from mcap.writer import Writer
 
 VERSION = os.environ.get("VERSION", "0.0.0")
@@ -49,7 +55,7 @@ POLLS = [
     ("/system-information/system/temperature", 1, True),
     ("/system-information/system/network", 1, True),
     ("/system-information/system/disk", 5, True),
-    ("/kraken/v1.0/stats", 5, True),
+    ("/kraken/v1.0/stats", 10, True),  # docker stats of every container takes ~2 s of work
     ("/system-information/system/process", 10, True),
     ("/system-information/platform", 5, False),
     ("/system-information/system/info", 30, False),
@@ -122,13 +128,25 @@ def iso(ns: int) -> str:
     return datetime.fromtimestamp(ns / 1e9, timezone.utc).isoformat(timespec="milliseconds")
 
 
+# Time references, best first. A lower one never replaces a higher one, like ArduPilot's RTC source priority.
+RANK = {"ntp": 2, "autopilot": 1, "linux_unsynced": 0}
+NTP_DRIFT_NS = 10_000_000  # NTP slews Linux a little all the time; only re-record its reference past this
+
+
 class Clock:
     """Maps the monotonic clock to UTC: corrected = mono + shift, like ArduPilot's rtc_shift."""
 
     def __init__(self):
-        self.shift = self.linux = linux_shift()
-        self.source = "linux_clock"
+        self.start_shift = self.shift = self.linux = linux_shift()
+        self.source = "ntp" if ntp_synced() else "linux_unsynced"
         self.syncs = 0
+
+    @property
+    def synced(self) -> bool:
+        return self.source != "linux_unsynced"
+
+    def reference(self) -> dict:
+        return {"source": self.source, "synced": self.synced, "shift_ns": self.shift}
 
 
 class Recorder:
@@ -155,32 +173,36 @@ class Recorder:
             self.dropped += 1
             return
         mono, wall = time.monotonic_ns(), time.time_ns()
-        corrected = mono + self.clock.shift
         if topic not in self.channels:
             self.channels[topic] = self.writer.register_channel(topic, message_encoding="json", schema_id=0)
-        envelope = {"mono_ns": mono, "wall_ns": wall, "corrected_ns": corrected, "data": data}
+        envelope = {"mono_ns": mono, "wall_ns": wall, "corrected_ns": mono + self.clock.shift,
+                    "time_synced_externally": self.clock.synced, "time_source": self.clock.source, "data": data}
         payload = json.dumps(envelope, separators=(",", ":")).encode()
-        self.writer.add_message(self.channels[topic], log_time=corrected, data=payload, publish_time=wall)
+        # MCAP readers sort by log_time, so it must never jump: monotonic time placed at the wall time of the start.
+        log_time = mono + self.clock.start_shift
+        self.writer.add_message(self.channels[topic], log_time=log_time, data=payload, publish_time=wall)
         self.messages += 1
 
     def event(self, text: str) -> None:
         print(text, flush=True)
         self.write("/logger/events", {"event": text})
 
-    def sync(self, source: str, shift: int, **extra) -> None:
+    def sync(self, source: str, shift: int, **extra) -> bool:
+        """Moves the reference to `source` unless a better one is already in use. Returns whether it moved."""
+        if RANK[source] < RANK[self.clock.source]:
+            return False
         previous = self.clock.shift
         self.clock.shift, self.clock.source = shift, source
         self.clock.syncs += 1
-        self.write("/time/sync", {"source": source, "shift_ns": shift, "previous_shift_ns": previous,
-                                  "step_ns": shift - previous, "boottime_ns": time.clock_gettime_ns(BOOTTIME),
-                                  "linux_ntp_synced": ntp_synced(), **extra})
-        print(f"time sync from {source}: corrected time is now {iso(time.monotonic_ns() + shift)}", flush=True)
+        self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": previous, "step_ns": shift - previous,
+                                  "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": ntp_synced(),
+                                  **extra})
+        print(f"time reference {source}: corrected time is now {iso(time.monotonic_ns() + shift)}", flush=True)
+        return True
 
     def finish(self) -> None:
-        clock = self.clock
-        # Lets offline tools re-stamp messages recorded before the first sync: corrected = mono_ns + final_shift_ns.
-        self.writer.add_metadata("time_sync", {"final_shift_ns": str(clock.shift), "final_source": clock.source,
-                                               "sync_count": str(clock.syncs)})
+        # The reference export() applies to the whole file: corrected = mono_ns + shift_ns.
+        self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
         self.writer.finish()
         self.file.close()
 
@@ -218,13 +240,10 @@ def autopilot_time(message: dict) -> None:
     if unix_ns < OLDEST_VALID_NS:  # the autopilot has no time source yet
         return
     # ArduPilot never moves its clock backwards, so after a bad SYSTEM_TIME from a topside it can stay wrong while NTP
-    # has already fixed Linux. Trust it only while Linux has nothing better (offline, or a Pixhawk with GPS).
-    if ntp_synced():
-        return
+    # has already fixed Linux. That's why it ranks below NTP (see RANK).
     shift = unix_ns - time.monotonic_ns()
-    if abs(shift - clock.shift) > AUTOPILOT_STEP_NS:
-        rec.sync("autopilot_system_time", shift, time_unix_usec=message["time_unix_usec"],
-                 time_boot_ms=message.get("time_boot_ms"))
+    if clock.source != "autopilot" or abs(shift - clock.shift) > AUTOPILOT_STEP_NS:
+        rec.sync("autopilot", shift, time_unix_usec=message["time_unix_usec"], time_boot_ms=message.get("time_boot_ms"))
 
 
 async def websocket(name: str, path: str, handle) -> None:
@@ -267,9 +286,7 @@ def on_linux_clock_set() -> None:
     synced = ntp_synced()
     rec.write("/time/linux_clock_set", {"shift_ns": shift, "previous_shift_ns": previous, "step_ns": shift - previous,
                                         "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": synced})
-    # An unsynchronized Linux clock does not override a valid autopilot time (see autopilot_time).
-    if clock.source == "linux_clock" or synced:
-        rec.sync("linux_clock", shift)
+    rec.sync("ntp" if synced else "linux_unsynced", shift)
 
 
 async def watch_linux_clock() -> None:
@@ -299,12 +316,13 @@ async def watch_linux_clock() -> None:
     loop.add_reader(fd, on_ready)
     try:
         synced = None
-        while True:  # the NTP state is what decides whether the autopilot's time is trusted, so keep it in the log
+        while True:
             if (now := ntp_synced()) != synced:
                 synced = now
                 rec.write("/time/linux_ntp", {"synced": synced})
-                if synced and clock.source != "linux_clock":  # NTP outranks the autopilot, even if it got there by slew
-                    rec.sync("linux_clock", linux_shift())
+            # NTP can reach sync by slewing alone, with no clock set to notice it.
+            if synced and (clock.source != "ntp" or abs(linux_shift() - clock.shift) > NTP_DRIFT_NS):
+                rec.sync("ntp", linux_shift())
             await asyncio.sleep(1)
     finally:
         loop.remove_reader(fd)
@@ -354,6 +372,140 @@ async def tail_service_logs() -> None:
         await asyncio.sleep(1)
 
 
+def parse_docker_line(line: str) -> tuple[str, int | None]:
+    """Splits Docker's `timestamps=1` prefix off a log line. Returns the text and Docker's time in Unix ns."""
+    stamp, _, text = line.partition(" ")
+    try:
+        seconds, _, fraction = stamp.rstrip("Z").partition(".")
+        whole = datetime.fromisoformat(seconds + "+00:00").timestamp()
+        return text, int(whole) * 10**9 + int(fraction.ljust(9, "0")[:9] or 0)
+    except ValueError:
+        return line, None
+
+
+def follow_container(loop, container: dict, since_ns: int, backfill_until_ns: int, last_seen: dict) -> None:
+    """Runs in its own thread until the container stops: a log stream can stay silent for hours."""
+    name = container["Names"][0].lstrip("/")
+    base = f"http://{HOST}/docker/containers/{container['Id']}"
+    tty = get_json(f"/docker/containers/{container['Id']}/json")["Config"]["Tty"]
+    since = f"{since_ns // 10**9}.{since_ns % 10**9:09d}"
+    url = f"{base}/logs?follow=1&stdout=1&stderr=1&timestamps=1&since={since}"
+    with urllib.request.urlopen(url, timeout=None) as response:
+        while True:
+            if tty:  # one raw stream
+                stream, payload = "stdout", response.readline()
+            else:  # 8-byte frame headers: stream type, then payload size
+                header = response.read(8)
+                if len(header) < 8:
+                    return
+                stream = "stderr" if header[0] == 2 else "stdout"
+                payload = response.read(int.from_bytes(header[4:], "big"))
+            if not payload:
+                return
+            for line in payload.decode(errors="replace").splitlines():
+                text, docker_ns = parse_docker_line(line)
+                if docker_ns:
+                    last_seen[name] = docker_ns
+                data = {"line": text, "stream": stream, "docker_time_ns": docker_ns,
+                        "backfill": docker_ns is not None and docker_ns < backfill_until_ns}
+                loop.call_soon_threadsafe(rec.write, f"/docker/logs/{name}", data)
+
+
+async def follow_container_logs() -> None:
+    """Logs of every container, BlueOS core and all extensions, through BlueOS's read-only Docker proxy."""
+    loop = asyncio.get_running_loop()
+    started_ns = time.time_ns()
+    # Docker filters by its own wall-clock stamps. At start that means "since boot"; after a container restarts,
+    # "after the last line we got". ponytail: a clock stepped back while a container restarts can still hide lines.
+    boot_ns = started_ns - time.clock_gettime_ns(BOOTTIME)
+    last_seen: dict[str, int] = {}
+    threads: dict[str, Thread] = {}
+    while True:
+        try:
+            containers = await asyncio.to_thread(get_json, "/docker/containers/json")
+        except Exception as error:
+            rec.errors["/docker/containers/json"] = f"{type(error).__name__}: {error}"
+            containers = []
+        for container in containers:
+            name = container["Names"][0].lstrip("/")
+            if name not in threads or not threads[name].is_alive():
+                since = last_seen[name] + 1 if name in last_seen else boot_ns
+                threads[name] = Thread(target=follow_container, daemon=True,
+                                       args=(loop, container, since, started_ns, last_seen))
+                threads[name].start()
+        await asyncio.sleep(10)
+
+
+class _Counting:
+    """mcap's Writer asks for tell(), which an HTTP response can't answer."""
+
+    def __init__(self, out):
+        self.out, self.position = out, 0
+
+    def write(self, data: bytes) -> int:
+        self.out.write(data)
+        self.position += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self.position
+
+
+def records(path: Path):
+    """Every record of a recording, including one still being written or cut short by a power loss."""
+    with path.open("rb") as file:
+        try:
+            yield from StreamReader(file).records
+        except Exception:  # the unfinished end of the file
+            return
+
+
+def final_reference(path: Path) -> dict:
+    if path == rec.path:
+        return clock.reference()
+    try:  # a finished file has it in its summary
+        with path.open("rb") as file:
+            for metadata in make_reader(file).iter_metadata():
+                if metadata.name == "time":
+                    m = metadata.metadata
+                    return {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
+    except Exception:
+        pass
+    # An unfinished file: the reference only ever improves, so the last /time/sync record is the best one.
+    channels, best = {}, None
+    for record in records(path):
+        if isinstance(record, Channel):
+            channels[record.id] = record.topic
+        elif isinstance(record, Message) and channels.get(record.channel_id) == "/time/sync":
+            data = json.loads(record.data)["data"]
+            best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
+    return best
+
+
+def export(path: Path, out) -> None:
+    """Writes `path` re-stamped with the best time reference of the whole run, which mono_ns makes possible:
+    it never jumps within a boot, so one shift is right for every message, before and after the sync."""
+    reference = final_reference(path)
+    writer = Writer(_Counting(out))
+    writer.start(library=f"blueos-complete-data-logger/{VERSION}")
+    channels: dict[int, int] = {}
+    for record in records(path):
+        if isinstance(record, Channel):
+            channels[record.id] = writer.register_channel(record.topic, message_encoding="json", schema_id=0)
+        elif isinstance(record, Metadata) and record.name != "time":
+            writer.add_metadata(record.name, record.metadata)
+        elif isinstance(record, Message) and reference:
+            envelope = json.loads(record.data)
+            envelope["corrected_ns"] = envelope["mono_ns"] + reference["shift_ns"]
+            envelope["time_synced_externally"] = reference["synced"]
+            envelope["time_source"] = reference["source"]
+            writer.add_message(channels[record.channel_id], log_time=envelope["corrected_ns"],
+                               data=json.dumps(envelope, separators=(",", ":")).encode(),
+                               publish_time=record.publish_time)
+    writer.add_metadata("time", {k: str(v) for k, v in (reference or {}).items()})
+    writer.finish()
+
+
 async def watch_disk() -> None:
     while True:
         paused = shutil.disk_usage(LOG_DIR).free < MIN_FREE_BYTES
@@ -399,8 +551,8 @@ def status() -> dict:
         "dropped": rec.dropped,
         "links": rec.links,
         "failing_endpoints": rec.errors,
-        "time": {"source": clock.source, "syncs": clock.syncs, "corrected": iso(mono + clock.shift),
-                 "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
+        "time": {"source": clock.source, "synced_externally": clock.synced, "syncs": clock.syncs,
+                 "corrected": iso(mono + clock.shift), "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
     }
 
 
@@ -409,7 +561,7 @@ def page() -> str:
     rows = "".join(
         f"<tr><td>{escape(p.name)}{' (recording)' if p == rec.path else ''}</td>"
         f"<td>{p.stat().st_size / 2**20:.1f} MB</td>"
-        f"<td><a href='download/{quote(p.name)}'>Download</a></td>"
+        f"<td><a href='download/{quote(p.name)}'>Download</a> (<a href='raw/{quote(p.name)}'>raw</a>)</td>"
         + ("<td></td></tr>" if p == rec.path else
            f"<td><form method='post' action='delete/{quote(p.name)}'>"
            f"<button aria-label='Delete {escape(p.name)}'>Delete</button></form></td></tr>")
@@ -424,11 +576,13 @@ td,th{{padding:6px 8px;border-bottom:1px solid #8884;text-align:left}}form{{marg
 <h1>Complete Data Logger</h1>
 <p><strong>{state}</strong> to {escape(s['file'])}: {s['messages']} messages on {s['topics']} topics,
 {s['dropped']} dropped.</p>
-<p>Time source: {escape(s['time']['source'])} ({s['time']['syncs']} syncs). Corrected time {s['time']['corrected']},
-Linux time {s['time']['linux']} (NTP synchronized: {s['time']['linux_ntp_synced']}).</p>
+<p><strong>Time {'synchronized externally' if s['time']['synced_externally'] else 'NOT synchronized externally'}</strong>
+(source: {escape(s['time']['source'])}, {s['time']['syncs']} reference changes). Corrected time {s['time']['corrected']},
+Linux time {s['time']['linux']}, Linux NTP synchronized: {s['time']['linux_ntp_synced']}.</p>
 <p>Streams: {escape(', '.join(f'{k} {v}' for k, v in s['links'].items()) or 'connecting')}</p>
 <h2>Failing endpoints</h2><ul>{failing}</ul>
-<h2>Recordings</h2><table><thead><tr><th>File</th><th>Size</th><th></th><th></th></tr></thead>
+<h2>Recordings</h2>
+<p>Download gives every message the best time reference of the whole run. Raw is the file as recorded.</p><table><thead><tr><th>File</th><th>Size</th><th></th><th></th></tr></thead>
 <tbody>{rows}</tbody></table></body></html>"""
 
 
@@ -455,6 +609,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/status":
             self.reply(200, json.dumps(status()).encode(), "application/json")
         elif path.startswith("/download/") and (file := self.recording("/download/")):
+            self.send_response(200)  # no length: the re-stamped file is built while it streams
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{file.stem}_synced.mcap"')
+            self.end_headers()
+            export(file, self.wfile)
+        elif path.startswith("/raw/") and (file := self.recording("/raw/")):
             size = file.stat().st_size  # the active file keeps growing, so send a snapshot
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -491,7 +651,7 @@ async def main() -> None:
         "start_mono_ns": str(time.monotonic_ns()),
         "start_wall_ns": str(time.time_ns()),
     })
-    rec.sync("linux_clock", clock.linux)  # the reference at start
+    rec.sync(clock.source, clock.shift)  # the reference at start
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     print(f"Recording to {rec.path}, web interface on port {PORT}", flush=True)
@@ -501,6 +661,7 @@ async def main() -> None:
     sources["kernel"] = lambda: websocket("kernel", "/system-information/ws/kernel_buffer", handle_kernel)
     sources["linux clock"] = watch_linux_clock
     sources["service logs"] = tail_service_logs
+    sources["container logs"] = follow_container_logs
     sources["disk"] = watch_disk
     tasks = [asyncio.create_task(supervise(name, run)) for name, run in sources.items()]
 
