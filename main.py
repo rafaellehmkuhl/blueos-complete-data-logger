@@ -366,7 +366,8 @@ async def tail_service_logs() -> None:
     boot_wall = time.time() - time.clock_gettime(BOOTTIME)
     tails: dict[Path, list] = {}  # file -> [offset, partial line]
     first_scan = True
-    while True:
+
+    def scan() -> None:  # in a thread: the backlog since boot can be hundreds of MB, too much for the event loop
         if SERVICE_LOGS.is_dir():
             seen = set()
             for path in SERVICE_LOGS.glob("*/*"):
@@ -384,7 +385,10 @@ async def tail_service_logs() -> None:
                     continue
             for gone in tails.keys() - seen:
                 del tails[gone]
-            first_scan = False
+
+    while True:
+        await asyncio.to_thread(scan)
+        first_scan = False
         await asyncio.sleep(1)
 
 
@@ -429,7 +433,6 @@ def follow_container(container: dict, since_ns: int, backfill_until_ns: int, las
 
 async def follow_container_logs() -> None:
     """Logs of every container, BlueOS core and all extensions, through BlueOS's read-only Docker proxy."""
-    loop = asyncio.get_running_loop()
     started_ns = time.time_ns()
     # Docker filters by its own wall-clock stamps. At start that means "since boot"; after a container restarts,
     # "after the last line we got". ponytail: a clock stepped back while a container restarts can still hide lines.
