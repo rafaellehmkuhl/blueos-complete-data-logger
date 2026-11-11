@@ -92,6 +92,41 @@ POLLS = [
     ("/wifi-manager/v1.0/status", 5, False),
     ("/wifi-manager/v1.0/hotspot", 30, False),
 ]
+DEFAULT_PERIODS = {path: period for path, period, _ in POLLS}
+periods = dict(DEFAULT_PERIODS)  # what the user set, in seconds
+MIN_PERIOD, MAX_PERIOD = 0.1, 3600
+SETTINGS = LOG_DIR / "settings.json"
+
+
+def valid_period(value) -> bool:
+    return type(value) in (int, float) and MIN_PERIOD <= value <= MAX_PERIOD
+
+
+def load_settings() -> None:
+    try:
+        saved = json.loads(SETTINGS.read_text()).get("poll_periods", {})
+    except (OSError, ValueError, AttributeError):
+        return
+    periods.update({path: v for path, v in saved.items() if path in DEFAULT_PERIODS and valid_period(v)})
+
+
+def apply_periods(new) -> str | None:
+    """Sets poll periods and starts a new file, so every file has one set of rates. Returns an error, if any."""
+    if not isinstance(new, dict) or not new:
+        return "expected an object of poll path to period in seconds"
+    for path, value in new.items():
+        if path not in DEFAULT_PERIODS:
+            return f"unknown poll {path!r}"
+        if not valid_period(value):
+            return f"the period of {path} must be a number of seconds from {MIN_PERIOD} to {MAX_PERIOD}"
+    periods.update(new)
+    changed = {path: v for path, v in periods.items() if v != DEFAULT_PERIODS[path]}
+    temporary = SETTINGS.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"poll_periods": changed}, indent=2))
+    temporary.replace(SETTINGS)  # a power cut leaves the old settings or the new ones, never half
+    rec.event(f"poll periods changed: {json.dumps(changed)}")
+    rec.rotate()
+    return None
 
 # Logs end up shared with other people, so never write anything that looks like a credential.
 SECRET_KEY = re.compile(r"pass|secret|token|credential|api_?key|private_?key", re.IGNORECASE)
@@ -183,6 +218,7 @@ class Recorder:
             "start_mono_ns": str(time.monotonic_ns()),
             "start_wall_ns": str(time.time_ns()),
         })
+        self.writer.add_metadata("poll_periods_s", {path: str(period) for path, period in periods.items()})
         # The reference in use, so a file started after the sync is synchronized from its first message.
         self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": self.clock.shift, "step_ns": 0,
                                   "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": ntp_synced(),
@@ -266,7 +302,7 @@ def get_json(path: str):
     return json.loads(body) if body else None
 
 
-async def poll(path: str, period: float, always: bool) -> None:
+async def poll(path: str, always: bool) -> None:
     topic = "/blueos" + path.split("?")[0].rstrip("/*")
     last, generation = None, rec.generation
     while True:
@@ -283,7 +319,9 @@ async def poll(path: str, period: float, always: bool) -> None:
         if encoded != last or (always and not failed):
             rec.write(topic, data)
         last = encoded
-        await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
+        # Wait out the period, but a new file (which is also how new periods are applied) cuts the wait short.
+        while time.monotonic() - started < periods[path] and generation == rec.generation:
+            await asyncio.sleep(min(0.5, max(0.0, periods[path] - (time.monotonic() - started))))
 
 
 def autopilot_time(message: dict) -> None:
@@ -690,6 +728,10 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/register_service":
             self.reply(200, json.dumps(REGISTER_SERVICE).encode(), "application/json")
+        elif path == "/settings":
+            body = {"min": MIN_PERIOD, "max": MAX_PERIOD, "polls": [
+                {"path": p, "period": periods[p], "default": d, "always": a} for p, d, a in POLLS]}
+            self.reply(200, json.dumps(body).encode(), "application/json")
         elif path == "/status":
             self.reply(200, json.dumps(status()).encode(), "application/json")
         elif path.startswith("/download/") and (file := self.recording("/download/")):
@@ -715,6 +757,16 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not found", "text/plain")
 
     def do_POST(self) -> None:
+        if urlparse(self.path).path == "/settings":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if 0 < length <= 2**16 else None
+            except ValueError:
+                body = None
+            error = apply_periods(body.get("poll_periods") if isinstance(body, dict) else None)
+            self.reply(400 if error else 200, json.dumps({"error": error, "file": rec.path.name}).encode(),
+                       "application/json")
+            return
         if urlparse(self.path).path == "/new_file":
             finished = rec.rotate()
             self.reply(200, json.dumps({"finished": finished.name, "file": rec.path.name}).encode(), "application/json")
@@ -730,13 +782,14 @@ class Handler(BaseHTTPRequestHandler):
 
 async def main() -> None:
     global rec
+    load_settings()
     rec = Recorder(clock)
     rec.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     print(f"Recording to {rec.path}, web interface on port {PORT}", flush=True)
 
-    sources = {f"poll {path}": (lambda p=path, s=period, a=always: poll(p, s, a)) for path, period, always in POLLS}
+    sources = {f"poll {path}": (lambda p=path, a=always: poll(p, a)) for path, _, always in POLLS}
     sources["mavlink2rest"] = lambda: websocket("mavlink2rest", "/mavlink2rest/ws/mavlink?filter=.*", handle_mavlink)
     sources["kernel"] = lambda: websocket("kernel", "/system-information/ws/kernel_buffer", handle_kernel)
     sources["linux clock"] = watch_linux_clock

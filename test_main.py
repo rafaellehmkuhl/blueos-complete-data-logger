@@ -85,6 +85,24 @@ def test() -> None:
     new = messages(main.rec.path.read_bytes())
     assert new[0][0] == "/time/sync" and new[0][2]["data"]["file_start"] and new[0][2]["time_synced_externally"]
     assert [e["data"]["v"] for topic, _, e in new if topic == "/a"] == [4]
+
+    # Poll periods: checked as a whole, saved, applied in a new file that records them.
+    main.rec = main.Recorder(main.clock)
+    main.rec.start()
+    cpu = "/system-information/system/cpu"
+    before = main.rec.path
+    assert main.apply_periods({cpu: 0.5, "/nope": 1})  # an error, and nothing applied
+    assert main.apply_periods({cpu: 0}) and main.apply_periods({cpu: True}) and main.apply_periods({cpu: "1"})
+    assert main.periods[cpu] == 1 and main.rec.path == before
+    assert main.apply_periods({cpu: 0.5}) is None
+    assert main.periods[cpu] == 0.5 and main.rec.path != before
+    assert json.loads(main.SETTINGS.read_text()) == {"poll_periods": {cpu: 0.5}}
+    main.periods[cpu] = 1
+    main.load_settings()
+    assert main.periods[cpu] == 0.5
+    main.rec.finish()
+    reader = make_reader(io.BytesIO(main.rec.path.read_bytes()))
+    assert {m.name: m.metadata for m in reader.iter_metadata()}["poll_periods_s"][cpu] == "0.5"
     print("ok")
 
 

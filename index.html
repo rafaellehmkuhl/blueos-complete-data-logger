@@ -222,6 +222,55 @@
   .tip[data-side="top"]::after { bottom: -4px; }
   .tip[data-side="bottom"]::after { top: -4px; }
 
+  /* Polling rates */
+  details > summary { list-style: none; display: flex; align-items: center; gap: 12px; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary h2 { margin: 0; line-height: 1.5; }
+  .polls-summary { margin-inline-start: auto; color: var(--muted); font-size: 13px; }
+  .chevron { width: 18px; height: 18px; color: var(--muted); transition: transform .3s cubic-bezier(.2, .8, .2, 1); }
+  details[open] .chevron { transform: rotate(180deg); }
+  details[open] .polls-body { animation: rise .35s cubic-bezier(.2, .8, .2, 1) both; }
+  .polls-body { margin-top: 16px; }
+  .polls { columns: 2 400px; column-gap: 28px; }
+  .group { break-inside: avoid; padding-bottom: 18px; }
+  .group h3 { margin: 0 0 6px; font-size: 13px; font-weight: 650; }
+  .poll {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto 28px; align-items: center; gap: 10px;
+    padding: 6px 8px 6px 10px; border-radius: 9px; border-inline-start: 3px solid transparent;
+    transition: background .25s, border-color .25s;
+  }
+  .poll:hover { background: var(--surface-2); }
+  .poll.changed { border-color: var(--accent); background: var(--accent-soft); }
+  .poll.faster { border-color: var(--warn); background: var(--warn-soft); }
+  .poll.invalid { border-color: var(--rec); background: var(--rec-soft); }
+  .poll-path { font: 13px var(--mono); overflow-wrap: anywhere; }
+  .poll-mode { font-size: 11px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); padding: 2px 8px; border-radius: 999px; background: var(--surface-2); white-space: nowrap; }
+  .period { display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); transition: border-color .2s, box-shadow .2s; }
+  .period:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .poll.invalid .period { border-color: var(--rec); }
+  .period input { width: 64px; padding: 6px 0; border: 0; background: transparent; color: var(--text); font: 600 14px var(--mono); text-align: right; outline: none; }
+  .period span { color: var(--muted); font-size: 13px; }
+  .poll .reset { width: 28px; height: 28px; padding: 0; justify-content: center; opacity: 0; pointer-events: none; transition: opacity .2s; }
+  .poll.changed .reset, .poll.faster .reset, .poll.invalid .reset { opacity: 1; pointer-events: auto; }
+  .polls-warning {
+    display: grid; grid-template-rows: 0fr; opacity: 0; margin: 0; padding: 0 14px; border-radius: 12px;
+    background: var(--warn-soft); color: var(--warn); font-size: 14px; transition: grid-template-rows .35s, opacity .35s, margin .35s, padding .35s;
+    grid-template-columns: 20px 1fr; gap: 10px; overflow: hidden;
+  }
+  .polls-warning > * { min-height: 0; }
+  .polls-warning svg { width: 20px; height: 20px; }
+  .polls-warning.show { grid-template-rows: 1fr; opacity: 1; margin-bottom: 16px; padding: 12px 14px; }
+  .polls-warning div { color: var(--text); }
+  .polls-bar {
+    position: sticky; bottom: 12px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 18px;
+    padding: 10px 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow);
+    transition: transform .3s cubic-bezier(.2, .8, .2, 1), opacity .3s;
+  }
+  .polls-bar.dirty { transform: translateY(-2px); }
+  .polls-changes { margin-inline-end: auto; color: var(--muted); font-size: 13px; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn.primary.done { background: var(--ok); border-color: var(--ok); }
+
   .bump { animation: bump .45s ease; }
   @keyframes bump { 40% { color: var(--accent); } }
 
@@ -303,6 +352,32 @@
                 data-tip="Stored on the vehicle in &lt;code&gt;/usr/blueos/extensions/complete-data-logger&lt;/code&gt;, numbered in order so they sort right even when the clock was wrong.">i</button>
       </h2>
       <ul class="rec-list" id="recs"></ul>
+    </section>
+
+    <section class="card span-12" aria-labelledby="h-polls">
+      <details id="polls-details">
+        <summary>
+          <h2 id="h-polls">Polling rates
+            <button class="info" type="button" aria-label="About polling rates"
+                    data-tip="&lt;strong&gt;How often each BlueOS service is asked for its state&lt;/strong&gt;Edit as many as you like: nothing changes until you press Apply. Applying starts a new file, so every file has a single set of rates, saved in its metadata.">i</button>
+          </h2>
+          <span class="polls-summary" id="polls-summary"></span>
+          <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="polls-body">
+          <div class="polls-warning" id="polls-warning" role="note">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 8v5m0 3.5h.01"/><circle cx="12" cy="12" r="9"/></svg>
+            <div><strong>Faster than the default.</strong> This makes the file bigger, and the service may not keep up with that rate. Test it and check that it works well before relying on it.</div>
+          </div>
+          <div class="polls" id="polls"></div>
+          <div class="polls-bar" id="polls-bar">
+            <span class="polls-changes" id="polls-changes" aria-live="polite"></span>
+            <button class="btn" type="button" id="polls-discard">Discard</button>
+            <button class="btn primary" type="button" id="polls-apply"
+                    data-tip="&lt;strong&gt;Apply and start a new file&lt;/strong&gt;Saves the rates, which then survive restarts, closes the current file and continues in a new one recorded with the new rates.">Apply</button>
+          </div>
+        </div>
+      </details>
     </section>
   </div>
 </main>
@@ -516,6 +591,119 @@ $("new-file").addEventListener("click", async (e) => {
   }
   setTimeout(() => { btn.classList.remove("busy", "done"); label.textContent = "New file"; }, 2000);
 });
+
+// Polling rates: edits stay local until Apply.
+let pollSettings = null;
+const edits = {};
+const groupNames = {
+  "system-information": "System information", kraken: "Extensions (Kraken)", bag: "Bag of holding",
+  "ardupilot-manager": "Autopilot manager", beacon: "Beacon", bridget: "Bridget", "cable-guy": "Cable guy",
+  commander: "Commander", helper: "Helper", "mavlink-camera-manager": "Camera manager",
+  "nmea-injector": "NMEA injector", ping: "Ping", "version-chooser": "Version chooser", "wifi-manager": "Wi-Fi manager",
+};
+const hz = (period) => period >= 1 ? `once every ${period} s` : `${+(1 / period).toFixed(2)} times a second`;
+
+function pollState(poll) {
+  const raw = edits[poll.path];
+  const value = raw === undefined ? poll.period : Number(raw);
+  const invalid = raw !== undefined && (raw === "" || !Number.isFinite(value) || value < pollSettings.min || value > pollSettings.max);
+  return { value, invalid, changed: !invalid && value !== poll.period, faster: !invalid && value < poll.default };
+}
+
+function renderPolls() {
+  const groups = {};
+  for (const poll of pollSettings.polls) (groups[poll.path.split("/")[1]] ??= []).push(poll);
+  $("polls").innerHTML = Object.entries(groups).map(([group, polls]) => `
+    <div class="group"><h3>${esc(groupNames[group] || group)}</h3>
+      ${polls.map((poll) => `
+        <div class="poll" data-path="${esc(poll.path)}">
+          <span class="poll-path">${esc(poll.path.slice(group.length + 1).replace(/^\/v[\d.]+\//, "/") || "/")}</span>
+          <span class="poll-mode" tabindex="0" data-tip="${poll.always
+            ? "Written to the file at every poll, even when it didn't change: small data that is useful as a time series."
+            : "Written only when the answer changes, so polling it often costs almost nothing in file size."}">${poll.always ? "Every poll" : "On change"}</span>
+          <label class="period" data-tip="">
+            <input type="number" inputmode="decimal" min="${pollSettings.min}" max="${pollSettings.max}" step="any"
+                   value="${poll.period}" aria-label="Seconds between polls of ${esc(poll.path)}">
+            <span>s</span>
+          </label>
+          <button class="btn ghost reset" type="button" aria-label="Back to the default for ${esc(poll.path)}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg>
+          </button>
+        </div>`).join("")}
+    </div>`).join("");
+  updatePolls();
+}
+
+function updatePolls() {
+  let changes = 0, faster = false, invalid = false;
+  for (const row of $("polls").querySelectorAll(".poll")) {
+    const poll = pollSettings.polls.find((p) => p.path === row.dataset.path), state = pollState(poll);
+    row.classList.toggle("changed", state.changed);
+    row.classList.toggle("faster", state.faster);
+    row.classList.toggle("invalid", state.invalid);
+    changes += state.changed; faster ||= state.faster; invalid ||= state.invalid;
+    const reset = row.querySelector(".reset");
+    reset.dataset.tip = `Back to the default, ${hz(poll.default)}.`;
+    row.querySelector(".period").dataset.tip = state.invalid
+      ? `<strong>Not a valid period</strong>Use a number of seconds from ${pollSettings.min} to ${pollSettings.max}.`
+      : `${state.changed ? `<strong>Was ${poll.period} s</strong>` : ""}Polled ${hz(state.value)}. Default: ${poll.default} s.`
+        + (state.faster ? " <b>Faster than the default.</b>" : "");
+  }
+  $("polls-warning").classList.toggle("show", faster);
+  $("polls-bar").classList.toggle("dirty", changes > 0);
+  $("polls-apply").disabled = !changes || invalid;
+  $("polls-discard").disabled = !changes && !invalid;
+  $("polls-changes").textContent = invalid ? "Fix the highlighted period first"
+    : changes ? `${changes} unsaved change${changes > 1 ? "s" : ""}, nothing changes until you apply` : "No changes";
+  const custom = pollSettings.polls.filter((p) => p.period !== p.default).length;
+  $("polls-summary").textContent = `${pollSettings.polls.length} endpoints${custom ? `, ${custom} customized` : ", all at their defaults"}`;
+}
+
+async function loadPolls() {
+  pollSettings = await (await fetch("settings", { cache: "no-store" })).json();
+  for (const key of Object.keys(edits)) delete edits[key];
+  renderPolls();
+}
+
+$("polls").addEventListener("input", (e) => {
+  const row = e.target.closest(".poll");
+  if (row && e.target.matches("input")) { edits[row.dataset.path] = e.target.value.trim(); updatePolls(); }
+});
+$("polls").addEventListener("click", (e) => {
+  const reset = e.target.closest(".reset");
+  if (!reset) return;
+  const row = reset.closest(".poll"), poll = pollSettings.polls.find((p) => p.path === row.dataset.path);
+  edits[poll.path] = String(poll.default);
+  row.querySelector("input").value = poll.default;
+  hideTip();
+  updatePolls();
+});
+$("polls-discard").addEventListener("click", () => { hideTip(); loadPolls(); });
+$("polls-apply").addEventListener("click", async () => {
+  const btn = $("polls-apply"), changed = {};
+  for (const poll of pollSettings.polls) {
+    const state = pollState(poll);
+    if (state.changed) changed[poll.path] = state.value;
+  }
+  btn.disabled = true;
+  hideTip();
+  const response = await fetch("settings", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ poll_periods: changed }),
+  });
+  const result = await response.json().catch(() => ({ error: response.statusText }));
+  if (result.error) {
+    $("polls-changes").textContent = result.error;
+    btn.disabled = false;
+    return;
+  }
+  await loadPolls();
+  btn.classList.add("done");
+  btn.textContent = "Applied, new file started";
+  $("polls-changes").textContent = `Recording to ${result.file}`;
+  refresh();
+  setTimeout(() => { btn.classList.remove("done"); btn.textContent = "Apply"; updatePolls(); }, 2500);
+});
+loadPolls();
 
 let last = null;
 async function refresh() {
