@@ -103,6 +103,12 @@ def test() -> None:
     main.rec.finish()
     reader = make_reader(io.BytesIO(main.rec.path.read_bytes()))
     assert {m.name: m.metadata for m in reader.iter_metadata()}["poll_periods_s"][cpu] == "0.5"
+
+    # The disk: recording stops at 95% used, or under the minimum free, whichever comes first.
+    usage = main.shutil._ntuple_diskusage
+    assert not main.disk_full(usage(total=100 * 2**30, used=90 * 2**30, free=10 * 2**30))
+    assert main.disk_full(usage(total=100 * 2**30, used=95 * 2**30, free=5 * 2**30))
+    assert main.disk_full(usage(total=4 * 2**30, used=3.5 * 2**30, free=0.5 * 2**30))
     print("ok")
 
 

@@ -41,6 +41,7 @@ INGEST_PORT = int(os.environ.get("INGEST_PORT", "9651"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
 SERVICE_LOGS = Path(os.environ.get("SERVICE_LOGS", "/var/logs/blueos/services"))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_MB", "1024")) * 2**20
+MAX_DISK_USE = float(os.environ.get("MAX_DISK_USE_PERCENT", "95")) / 100  # stop before the system runs out of space
 
 # SYSTEM_TIME arrives over a websocket, so its shift estimate jitters by the delivery latency.
 AUTOPILOT_STEP_NS = 1_000_000_000
@@ -652,11 +653,15 @@ async def serve_ingest() -> None:
         await asyncio.Future()
 
 
+def disk_full(usage) -> bool:
+    return usage.free < MIN_FREE_BYTES or (usage.total - usage.free) / usage.total >= MAX_DISK_USE
+
+
 async def watch_disk() -> None:
     while True:
-        paused = shutil.disk_usage(LOG_DIR).free < MIN_FREE_BYTES
+        paused = disk_full(shutil.disk_usage(LOG_DIR))
         if paused and not rec.paused:
-            rec.event(f"recording paused: less than {MIN_FREE_BYTES // 2**20} MB free")
+            rec.event(f"recording paused: disk over {MAX_DISK_USE:.0%} full or under {MIN_FREE_BYTES // 2**20} MB free")
             rec.paused = True
         elif rec.paused and not paused:
             rec.paused = False
@@ -700,6 +705,8 @@ def status() -> dict:
         "time": {"source": clock.source, "synced_externally": clock.synced, "syncs": clock.syncs,
                  "corrected": iso(mono + clock.shift), "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
         "version": VERSION,
+        "disk": {"total": (disk := shutil.disk_usage(LOG_DIR)).total, "free": disk.free,
+                 "max_use": MAX_DISK_USE, "min_free": MIN_FREE_BYTES},
         "recordings": [{"name": p.name, "size": p.stat().st_size, "active": p == rec.path}
                        for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True)],
     }

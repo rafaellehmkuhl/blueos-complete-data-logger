@@ -67,7 +67,7 @@ The extension page shows the recording live (message rate, topics, the corrected
 
 **Polling rates** sets how often each BlueOS service is asked for its state. Edit as many as you like; nothing changes until you press **Apply**, which saves them (they survive restarts) and starts a new file, so every file has one set of rates, recorded in its `poll_periods_s` metadata. Going faster than the default makes the file bigger and can be more than a service keeps up with, so the page warns about it: test before relying on it. Endpoints written only on change cost almost nothing to poll often; the ones written at every poll grow the file with every poll. Also available as `GET /settings` and `POST /settings` with `{"poll_periods": {"<path>": <seconds>}}`. Files live in `/usr/blueos/extensions/complete-data-logger` on the vehicle and are numbered, so their order holds even when the clock that named them was wrong.
 
-Recording pauses while less than 1 GB is free and resumes on its own. An hour takes roughly 50 MB.
+Recording pauses while the disk is over 95% full or has less than 1 GB free, so the vehicle never runs out of space, and resumes on its own. The page shows how fast the file grows and, at that rate, how long until the disk reaches the limit. An hour takes roughly 50 MB.
 
 If the vehicle loses power, the file has no index and the last chunk (up to 1 MB) is lost. `mcap recover <file>` rebuilds the rest.
 
@@ -93,7 +93,7 @@ Messages land on `/extensions/<name>/<topic>`, with `received_mono_ns` next to `
 
 ## Settings
 
-Environment variables, all optional: `MIN_FREE_MB` (default `1024`), `PORT` (`9650`), `INGEST_PORT` (`9651`), `BLUEOS_HOST` (`127.0.0.1`, change it to run the logger off-vehicle).
+Environment variables, all optional: `MAX_DISK_USE_PERCENT` (default `95`), `MIN_FREE_MB` (`1024`), `PORT` (`9650`), `INGEST_PORT` (`9651`), `BLUEOS_HOST` (`127.0.0.1`, change it to run the logger off-vehicle).
 
 ## Development
 
