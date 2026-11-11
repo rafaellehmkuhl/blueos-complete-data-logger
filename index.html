@@ -197,6 +197,8 @@
   .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
   .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
   .btn.ghost:hover { color: var(--rec); background: var(--rec-soft); }
+  .btn[aria-disabled="true"] { opacity: .35; cursor: not-allowed; }
+  .btn[aria-disabled="true"]:hover { color: var(--muted); background: transparent; }
   .btn.confirm { background: var(--rec); border-color: var(--rec); color: #fff; animation: shake .3s ease; }
   @keyframes shake { 25% { transform: translateX(-2px); } 75% { transform: translateX(2px); } }
   .empty { padding: 28px; text-align: center; color: var(--muted); }
@@ -452,9 +454,13 @@ function renderRecordings(list) {
         <div class="actions">
           <a class="btn primary" href="download/${enc}" data-tip="${esc(TIPS.download)}">${icons.down}Download</a>
           <a class="btn" href="raw/${enc}" data-tip="${esc(TIPS.raw)}">Raw</a>
-          ${r.active ? "" : `<button class="btn ghost" type="button" data-delete="${esc(r.name)}"
-            data-tip="Deletes this file from the vehicle. Click twice to confirm. Can't be undone."
-            aria-label="Delete ${esc(r.name)}">${icons.trash}</button>`}
+          ${r.active
+            ? `<button class="btn ghost" type="button" aria-disabled="true"
+                data-tip="The file being recorded can't be deleted. It can once the logger moves on to a new file."
+                aria-label="Delete ${esc(r.name)}, unavailable while recording">${icons.trash}</button>`
+            : `<button class="btn ghost" type="button" data-delete="${esc(r.name)}"
+                data-tip="Deletes this file from the vehicle. Click twice to confirm. Can't be undone."
+                aria-label="Delete ${esc(r.name)}">${icons.trash}</button>`}
         </div>`;
       if (li) li.replaceWith(fresh); else ul.insertBefore(fresh, ul.children[i] || null);
       li = fresh;
