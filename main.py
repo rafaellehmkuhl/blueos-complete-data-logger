@@ -23,11 +23,10 @@ import signal
 import time
 import urllib.request
 from datetime import datetime, timezone
-from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 import websockets
 from mcap.reader import make_reader
@@ -624,37 +623,13 @@ def status() -> dict:
         "failing_endpoints": rec.errors,
         "time": {"source": clock.source, "synced_externally": clock.synced, "syncs": clock.syncs,
                  "corrected": iso(mono + clock.shift), "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
+        "version": VERSION,
+        "recordings": [{"name": p.name, "size": p.stat().st_size, "active": p == rec.path}
+                       for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True)],
     }
 
 
-def page() -> str:
-    s = status()
-    rows = "".join(
-        f"<tr><td>{escape(p.name)}{' (recording)' if p == rec.path else ''}</td>"
-        f"<td>{p.stat().st_size / 2**20:.1f} MB</td>"
-        f"<td><a href='download/{quote(p.name)}'>Download</a> (<a href='raw/{quote(p.name)}'>raw</a>)</td>"
-        + ("<td></td></tr>" if p == rec.path else
-           f"<td><form method='post' action='delete/{quote(p.name)}'>"
-           f"<button aria-label='Delete {escape(p.name)}'>Delete</button></form></td></tr>")
-        for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True)
-    )
-    failing = "".join(f"<li>{escape(k)}: {escape(v)}</li>" for k, v in s["failing_endpoints"].items()) or "<li>None</li>"
-    state = "Paused, disk almost full" if s["paused"] else "Recording"
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Complete Data Logger</title>
-<style>:root{{color-scheme:light dark}}body{{font-family:system-ui,sans-serif;margin:16px;max-width:900px;background:Canvas;color:CanvasText}}table{{border-collapse:collapse;width:100%}}
-td,th{{padding:6px 8px;border-bottom:1px solid #8884;text-align:left}}form{{margin:0}}</style></head><body>
-<h1>Complete Data Logger</h1>
-<p><strong>{state}</strong> to {escape(s['file'])}: {s['messages']} messages on {s['topics']} topics,
-{s['dropped']} dropped.</p>
-<p><strong>Time {'synchronized externally' if s['time']['synced_externally'] else 'NOT synchronized externally'}</strong>
-(source: {escape(s['time']['source'])}, {s['time']['syncs']} reference changes). Corrected time {s['time']['corrected']},
-Linux time {s['time']['linux']}, Linux NTP synchronized: {s['time']['linux_ntp_synced']}.</p>
-<p>Streams: {escape(', '.join(f'{k} {v}' for k, v in s['links'].items()) or 'connecting')}</p>
-<h2>Failing endpoints</h2><ul>{failing}</ul>
-<h2>Recordings</h2>
-<p>Download gives every message the best time reference of the whole run. Raw is the file as recorded.</p><table><thead><tr><th>File</th><th>Size</th><th></th><th></th></tr></thead>
-<tbody>{rows}</tbody></table></body></html>"""
+PAGE = (Path(__file__).parent / "index.html").read_bytes()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -697,7 +672,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     size -= len(chunk)
         elif path == "/":
-            self.reply(200, page().encode(), "text/html; charset=utf-8")
+            self.reply(200, PAGE, "text/html; charset=utf-8")
         else:
             self.reply(404, b"Not found", "text/plain")
 
@@ -707,8 +682,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"No such finished recording", "text/plain")
             return
         file.unlink()
-        self.send_response(303)
-        self.send_header("Location", "../")
+        self.send_response(204)
         self.end_headers()
 
 
