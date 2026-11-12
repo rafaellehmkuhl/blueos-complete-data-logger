@@ -318,26 +318,36 @@
   #close-settings { margin-inline-start: auto; }
   #close-settings:hover { color: var(--text); background: var(--surface-2); }
   .polls-body { flex: 1; overflow-y: auto; padding: 18px 22px 4px; }
-  .setting {
-    display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-radius: 12px;
-    border: 1px solid var(--border); background: var(--surface-2); cursor: pointer;
+  .setting { margin: 0; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); }
+  .choice {
+    display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px; border-radius: 9px; cursor: pointer;
+    transition: background .2s;
   }
-  .setting strong { display: block; font-size: 15px; font-weight: 650; }
-  .setting span { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+  .choice:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
+  .choice:has(> input:checked) { background: var(--surface); }
+  .choice > input { flex: none; margin: 3px 0 0; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .choice strong { display: block; font-size: 14px; font-weight: 650; }
+  .choice span { display: block; margin-top: 2px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+  .sub { display: none; margin: 0 0 6px 40px; padding-inline-start: 12px; border-inline-start: 2px solid var(--border); animation: rise .3s ease both; }
+  .setting:has([name=start][value=armed]:checked) #armed-options,
+  #armed-options:has([name=stop][value=disarm]:checked) #disarm-options { display: block; }
+  .sub-title { margin: 8px 0 2px 12px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+  .delay { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 2px 0 6px 40px; }
+  .delay input[type=number] {
+    width: 84px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+    color: var(--text); font: 600 14px var(--mono); text-align: right;
+  }
+  .delay input[type=number]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .delay input[type=number]:disabled { opacity: .5; }
+  .units { display: inline-flex; padding: 2px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); }
+  .units label { position: relative; padding: 5px 10px; border-radius: 7px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; transition: background .2s, color .2s; }
+  .units input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .units label:has(input:checked) { background: var(--accent); color: #fff; }
+  .units label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .delay:has(input[value=now]:checked) .units { opacity: .5; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .setting-status { min-height: 1.4em; margin: 8px 2px 14px; color: var(--muted); font-size: 13px; }
   .setting-status.bad { color: var(--rec); }
-  .switch {
-    appearance: none; flex: none; position: relative; width: 46px; height: 28px; margin: 0 0 0 auto; border-radius: 999px;
-    background: color-mix(in srgb, var(--muted) 45%, transparent); cursor: pointer; transition: background .2s;
-  }
-  .switch::after {
-    content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
-    box-shadow: 0 1px 3px #0004; transition: transform .25s cubic-bezier(.2, .8, .2, 1.2);
-  }
-  .switch:checked { background: var(--ok); }
-  .switch:checked::after { transform: translateX(18px); }
-  .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .switch:disabled { opacity: .5; cursor: progress; }
   .section-title { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; font-size: 15px; font-weight: 650; }
   .polls { columns: 2 400px; column-gap: 28px; }
   .group { break-inside: avoid; padding-bottom: 18px; }
@@ -529,14 +539,36 @@
     </button>
   </div>
   <div class="polls-body">
-    <label class="setting" for="auto-record">
-      <div>
-        <strong>Start recording automatically</strong>
-        <span>Every time the extension starts: when the vehicle boots or the extension is updated. Turn it off to record only when you press Start, so the card is not used while you don't need it.</span>
+    <h3 class="section-title">Recording</h3>
+    <fieldset class="setting" id="recording-mode">
+      <legend class="visually-hidden">When recording starts</legend>
+      <label class="choice"><input type="radio" name="start" value="always" checked>
+        <div><strong>Start when the extension starts</strong><span>At every boot of the vehicle and after updates. The default.</span></div></label>
+      <label class="choice"><input type="radio" name="start" value="armed">
+        <div><strong>Start when the vehicle arms</strong><span>Every arm starts recording into a new file, unless it is already recording.</span></div></label>
+      <div class="sub" id="armed-options" role="radiogroup" aria-label="When recording stops">
+        <p class="sub-title">Stop recording</p>
+        <label class="choice"><input type="radio" name="stop" value="never" checked>
+          <div><strong>Only with Stop</strong><span>Goes on after the disarm, until you press Stop or the extension stops.</span></div></label>
+        <label class="choice"><input type="radio" name="stop" value="disarm">
+          <div><strong>When the vehicle disarms</strong><span>Arming again before the delay ends keeps the same file going.</span></div></label>
+        <div class="sub" id="disarm-options" role="radiogroup" aria-label="Delay after the disarm">
+          <label class="choice"><input type="radio" name="delay" value="now" checked><div><strong>Immediately</strong></div></label>
+          <label class="choice"><input type="radio" name="delay" value="after"><div><strong>After a delay</strong></div></label>
+          <div class="delay">
+            <input type="number" id="delay-value" min="1" step="any" value="60" aria-label="Delay">
+            <div class="units" role="radiogroup" aria-label="Unit">
+              <label><input type="radio" name="unit" value="seconds">seconds</label>
+              <label><input type="radio" name="unit" value="minutes" checked>minutes</label>
+              <label><input type="radio" name="unit" value="hours">hours</label>
+            </div>
+          </div>
+        </div>
       </div>
-      <input type="checkbox" role="switch" class="switch" id="auto-record" checked>
-    </label>
-    <p class="setting-status" id="auto-record-status" aria-live="polite"></p>
+      <label class="choice"><input type="radio" name="start" value="manual">
+        <div><strong>Only when I press Start</strong><span>Nothing is recorded, and the card is not used, until you press Start. Handy to choose each run, or to keep the extension installed for testing.</span></div></label>
+    </fieldset>
+    <p class="setting-status" id="recording-status" aria-live="polite"></p>
     <h3 class="section-title" id="h-polls">Polling rates
       <button class="info" type="button" aria-label="About polling rates"
               data-tip="&lt;strong&gt;How often each BlueOS service is asked for its state&lt;/strong&gt;Edit as many as you like: nothing changes until you press Apply. Applying starts a new file, so every file has a single set of rates, saved in its metadata." data-tip-side="bottom">i</button>
@@ -1118,7 +1150,7 @@ async function loadPolls() {
   const response = await fetch("settings", { cache: "no-store", signal: AbortSignal.timeout(5000) });
   if (!response.ok) throw new Error(response.statusText);
   pollSettings = await response.json();
-  $("auto-record").checked = pollSettings.auto_record !== false;
+  renderRecordingMode(pollSettings.recording);
   for (const key of Object.keys(edits)) delete edits[key];
   renderPolls();
 }
@@ -1164,25 +1196,61 @@ $("polls-apply").addEventListener("click", async () => {
 });
 loadPolls().catch(() => {});  // retried by refresh() until it works
 
-// Saved right away, unlike the rates: it only changes what happens at the next start.
-$("auto-record").addEventListener("change", async (e) => {
-  const box = e.currentTarget, on = box.checked, note = $("auto-record-status");
-  box.disabled = true;
-  note.classList.remove("bad");
-  const response = await fetch("settings", { method: "POST", headers: JSON_POST, body: JSON.stringify({ auto_record: on }) })
-    .catch(() => null);
-  const result = response ? await response.json().catch(() => ({ error: response.statusText })) : { error: "The logger is not answering. Try again." };
-  box.disabled = false;
-  if (result.error) {
-    box.checked = !on;
-    note.textContent = result.error;
+// The recording mode is saved at every change, unlike the rates: it only decides what happens at the next start,
+// arm or disarm, so there is nothing to apply to the current file.
+const UNITS = { seconds: 1, minutes: 60, hours: 3600 };
+const form = $("recording-mode");
+const picked = (name) => form.querySelector(`[name=${name}]:checked`).value;
+function setPicked(name, value) { form.querySelector(`[name=${name}][value=${value}]`).checked = true; }
+function renderRecordingMode(mode) {
+  if (!mode || form.contains(document.activeElement) && document.activeElement.type === "number") return;
+  setPicked("start", mode.start);
+  setPicked("stop", mode.stop_on_disarm ? "disarm" : "never");
+  setPicked("delay", mode.disarm_delay_s > 0 ? "after" : "now");
+  setPicked("unit", mode.disarm_delay_unit);
+  $("delay-value").value = mode.disarm_delay_s > 0 ? +(mode.disarm_delay_s / UNITS[mode.disarm_delay_unit]).toFixed(3) : 60;
+}
+function clockText(seconds) {
+  const t = Math.ceil(seconds), h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), sec = t % 60;
+  return `${h ? `${h}:${String(m).padStart(2, "0")}` : m}:${String(sec).padStart(2, "0")}`;
+}
+function delayText(seconds) {
+  const unit = seconds % 3600 === 0 ? "hour" : seconds % 60 === 0 ? "minute" : "second";
+  const n = seconds / { hour: 3600, minute: 60, second: 1 }[unit];
+  return `${+n.toFixed(3)} ${unit}${n === 1 ? "" : "s"}`;
+}
+function describeMode(m) {
+  if (m.start === "always") return "Every start of the extension begins recording.";
+  if (m.start === "manual") return "From the next start, nothing is recorded until you press Start.";
+  const stop = !m.stop_on_disarm ? "goes on until you press Stop"
+    : m.disarm_delay_s ? `stops ${delayText(m.disarm_delay_s)} after the disarm` : "stops at the disarm";
+  return `Recording starts at every arm and ${stop}.`;
+}
+form.addEventListener("change", async (e) => {
+  const note = $("recording-status");
+  if (e.target.name === "delay" && e.target.value === "after") $("delay-value").focus();
+  const value = Number($("delay-value").value), after = picked("delay") === "after";
+  if (after && !(value > 0)) {
+    note.textContent = "Type a delay greater than zero.";
     note.classList.add("bad");
     return;
   }
-  if (pollSettings) pollSettings.auto_record = on;
-  note.textContent = on
-    ? "Saved. Every start of the extension begins recording."
-    : `Saved. From the next start, nothing is recorded until you press Start.${stopped ? "" : " The current recording goes on: press Stop to end it now."}`;
+  const mode = {
+    start: picked("start"), stop_on_disarm: picked("stop") === "disarm",
+    disarm_delay_s: after ? value * UNITS[picked("unit")] : 0, disarm_delay_unit: picked("unit"),
+  };
+  const response = await fetch("settings", { method: "POST", headers: JSON_POST, body: JSON.stringify({ recording: mode }) })
+    .catch(() => null);
+  const result = response ? await response.json().catch(() => ({ error: response.statusText })) : { error: "The logger is not answering. Try again." };
+  note.classList.toggle("bad", !!result.error);
+  if (result.error) {
+    note.textContent = result.error;
+    renderRecordingMode(pollSettings?.recording);
+    return;
+  }
+  if (pollSettings) pollSettings.recording = mode;
+  note.textContent = `Saved. ${describeMode(mode)}`;
+  refresh();
 });
 
 // Edits stay while the sheet is closed, until Apply or Discard.
@@ -1216,12 +1284,18 @@ async function update() {
   const now = performance.now();
 
   const state = $("state");
+  const mode = s.recording_mode || {}, waitingArm = s.stopped && mode.start === "armed";
   state.className = `state${s.stopped ? " stopped" : s.write_error ? " error" : s.paused ? " paused" : ""}`;
-  $("state-text").textContent = s.stopped ? "STOPPED" : s.write_error ? "NOT RECORDING" : s.paused ? "PAUSED" : "REC";
-  state.dataset.tip = s.stopped
-    ? (s.file === "none"
-      ? "<strong>Stopped</strong>Automatic recording is off in Settings. Nothing is being recorded until you press Start."
-      : "<strong>Stopped</strong>Recording was stopped from this page. Nothing is being recorded until you press Start.")
+  $("state-text").textContent = waitingArm ? "WAITING FOR ARM" : s.stopped ? "STOPPED" : s.write_error ? "NOT RECORDING"
+    : s.paused ? "PAUSED" : s.stops_in_s != null ? `REC · STOPS IN ${clockText(s.stops_in_s)}` : "REC";
+  state.dataset.tip = waitingArm
+    ? "<strong>Waiting for the vehicle to arm</strong>Recording starts when it arms, as set in Settings. Or press Start to record now."
+    : s.stopped
+    ? (mode.start === "manual"
+      ? "<strong>Stopped</strong>Recording starts only when you press Start, as set in Settings."
+      : "<strong>Stopped</strong>Recording was stopped. Nothing is being recorded until you press Start.")
+    : s.stops_in_s != null
+    ? "<strong>Recording, the vehicle is disarmed</strong>Recording stops when this countdown ends, as set in Settings. Arming again keeps it going."
     : s.write_error
     ? `<strong>Not recording</strong>Writing to the card failed: ${esc(s.write_error)}. A new file is tried every 10 seconds.`
     : s.paused
@@ -1230,7 +1304,9 @@ async function update() {
   renderStop(!!s.stopped);
   $("write-error").classList.toggle("bad", !s.stopped);
   $("write-error").classList.toggle("show", !!(s.write_error || s.stopped));
-  $("write-error-text").textContent = s.stopped
+  $("write-error-text").textContent = waitingArm
+    ? "Waiting for the vehicle to arm. Recording starts on its own when it does, or press Start to record now."
+    : s.stopped
     ? "Recording is stopped. Nothing is being recorded until you press Start."
     : s.write_error
     ? `Nothing is being recorded: writing to the card failed (${s.write_error}). The card may be failing. A new file is tried every 10 seconds.`
@@ -1251,7 +1327,8 @@ async function update() {
   tween("topics", s.topics, (v) => String(Math.round(v)));  // up to 4 digits, no separator to fit its tile
   tween("dropped", s.dropped, short);
   $("dropped").parentElement.dataset.tip = `${fmt.format(s.dropped)} messages not recorded: while stopped, while the disk was too full, or while writing to the card failed.`;
-  $("file").textContent = s.file === "none" ? "No file yet: press Start to record" : s.file;
+  $("file").textContent = s.file !== "none" ? s.file
+    : waitingArm ? "No file yet: recording starts when the vehicle arms" : "No file yet: press Start to record";
 
   // File growth over the last 30 s: the file grows in chunks every few seconds, so a shorter window jumps around.
   const active = (s.recordings || []).find((r) => r.active);

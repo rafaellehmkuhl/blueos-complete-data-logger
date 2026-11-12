@@ -176,7 +176,7 @@ def test_poll_periods() -> None:
     assert main.periods[CPU] == 1 and main.rec.path == before
     assert main.apply_periods({CPU: 0.5}) is None
     assert main.periods[CPU] == 0.5 and main.rec.path != before
-    assert json.loads(main.SETTINGS.read_text()) == {"auto_record": True, "poll_periods": {CPU: 0.5}}
+    assert json.loads(main.SETTINGS.read_text()) == {"recording": main.DEFAULT_RECORDING, "poll_periods": {CPU: 0.5}}
     main.periods[CPU] = 1
     main.load_settings()
     assert main.periods[CPU] == 0.5
@@ -315,37 +315,77 @@ def test_stopping() -> None:
     assert set(main.LOG_DIR.glob("*.mcap")) == files
 
 
-def test_auto_record_off() -> None:
-    """With automatic recording off, the logger starts stopped and creates no file until Start. The setting is saved
-    with the rates, and a broken settings file falls back to recording."""
+def test_recording_modes() -> None:
+    """Manual and armed start without a file until Start or an arm. Armed records on every arm, and with
+    stop_on_disarm stops after the delay, unless armed again first. The mode survives restarts."""
     main.rec.finish()
     files = set(main.LOG_DIR.glob("*.mcap"))
     main.rec = main.Recorder(main.clock, record=False)
     main.rec.write("/a", {"v": 1})
     assert main.rec.stopped and main.rec.flush() is None and main.status()["file"] == "none"
+    assert main.rec.dropped == 0, "a stop on purpose is not a loss"
     assert set(main.LOG_DIR.glob("*.mcap")) == files, "no file until Start"
-    main.rec.restart()
-    main.rec.write("/a", {"v": 2})
-    main.rec.finish()
-    assert [e["data"]["v"] for e in topic(messages(main.rec.path.read_bytes()), "/a")] == [2]
 
-    fresh()
+    def heartbeat(is_armed, autopilot="MAV_AUTOPILOT_ARDUPILOTMEGA", system=1):
+        main.handle_mavlink({"header": {"system_id": system, "component_id": 1, "sequence": 0},
+                             "message": {"type": "HEARTBEAT", "autopilot": {"type": autopilot},
+                                         "base_mode": {"bits": 209 if is_armed else 81}}})
+        main.apply_arming()
+
     saved = main.SETTINGS.read_text() if main.SETTINGS.exists() else None
     try:
-        assert main.set_auto_record("no") and main.auto_record
-        assert main.set_auto_record(False) is None and not main.auto_record
-        main.auto_record = True
+        assert main.set_recording_mode({"start": "sometimes"}) and main.recording_mode["start"] == "always"
+        assert main.set_recording_mode({"nope": 1}) and main.set_recording_mode({"disarm_delay_s": -1})
+        assert main.set_recording_mode({"start": "armed"}) is None
+        heartbeat(False)
+        assert main.rec.stopped, "disarmed: waiting"
+        heartbeat(True, autopilot="MAV_AUTOPILOT_INVALID")
+        assert main.rec.stopped, "a GCS heartbeat is not the vehicle"
+        heartbeat(True)
+        first = main.rec.path
+        assert not main.rec.stopped and first.exists(), "recording from the arm"
+        heartbeat(False)
+        assert not main.rec.stopped, "keeps recording after the disarm unless stop_on_disarm"
+        main.rec.stop()
+        heartbeat(True)
+        assert not main.rec.stopped and main.rec.path != first, "every arm starts recording again"
+
+        assert main.set_recording_mode({"stop_on_disarm": True}) is None
+        heartbeat(True)  # the mode change forgets the arming state; still armed, already recording
+        heartbeat(False)
+        assert main.rec.stopped, "immediately with no delay"
+        assert any("because the vehicle disarmed" in e["data"]["event"]
+                   for e in topic(messages(main.rec.path.read_bytes()), "/logger/events"))
+
+        assert main.set_recording_mode({"disarm_delay_s": 3600, "disarm_delay_unit": "minutes"}) is None
+        heartbeat(True)
+        heartbeat(False)
+        assert not main.rec.stopped and 3590 < main.status()["stops_in_s"] <= 3600
+        heartbeat(True)
+        assert main.disarm_stop_at is None, "armed again: no stop"
+        heartbeat(False)
+        main.disarm_stop_at = time.monotonic() - 1  # the hour went by
+        main.apply_arming()
+        assert main.rec.stopped and main.status()["stops_in_s"] is None
+
+        main.recording_mode.update(main.DEFAULT_RECORDING)
         main.load_settings()
-        assert main.auto_record is False, "survives restarts"
+        assert main.recording_mode == {"start": "armed", "stop_on_disarm": True, "disarm_delay_s": 3600,
+                                       "disarm_delay_unit": "minutes"}, "survives restarts"
         assert main.apply_periods({CPU: 2}) is None
         main.load_settings()
-        assert main.auto_record is False and main.periods[CPU] == 2, "saving the rates keeps it"
-        main.SETTINGS.write_text("[1]")
-        main.auto_record = True
+        assert main.recording_mode["start"] == "armed" and main.periods[CPU] == 2, "saving the rates keeps it"
+        main.SETTINGS.write_text('{"auto_record": false}')  # v0.8.6
         main.load_settings()
-        assert main.auto_record
+        assert main.recording_mode["start"] == "manual"
+        main.recording_mode.update(main.DEFAULT_RECORDING)
+        main.SETTINGS.write_text("[1]")
+        main.load_settings()
+        assert main.recording_mode == main.DEFAULT_RECORDING
     finally:
-        main.auto_record = True
+        main.recording_mode.update(main.DEFAULT_RECORDING)
+        main.armed = main.disarm_stop_at = None
+        main.start_on_arm = False
         main.periods[CPU] = main.DEFAULT_PERIODS[CPU]
         main.SETTINGS.unlink(missing_ok=True)
         if saved is not None:
@@ -847,7 +887,7 @@ def test_http() -> None:
         code, body = call("/status")
         status = json.loads(body)
         for key in ("file", "messages", "topics", "paused", "stopped", "write_error", "dropped", "links", "idle_s",
-                    "mavlink_gaps", "failing_endpoints", "time", "version", "disk", "recordings"):
+                    "mavlink_gaps", "failing_endpoints", "time", "version", "disk", "recordings", "recording_mode", "armed", "stops_in_s"):
             assert key in status, key  # what index.html reads
         assert call("/")[0] == 200 and call("/settings")[0] == 200
         assert call("/download/..%2Fsettings.json")[0] == 404
@@ -858,11 +898,11 @@ def test_http() -> None:
         assert call("/settings", "POST", json.dumps({"poll_periods": {CPU: 0.5}}).encode(), "text/plain")[0] == 415
         assert main.periods[CPU] == 1
         assert call("/settings", "POST", b'{"poll_periods": {"/nope": 1}}')[0] == 400
-        assert call("/settings", "POST", b'{"auto_record": 1}')[0] == 400
-        code, body = call("/settings", "POST", b'{"auto_record": false}')
-        assert code == 200 and not json.loads(call("/settings")[1])["auto_record"]
-        assert not json.loads(call("/status")[1])["auto_record"]
-        assert call("/settings", "POST", b'{"auto_record": true}')[0] == 200 and main.auto_record
+        assert call("/settings", "POST", b'{"recording": {"start": 1}}')[0] == 400
+        code, body = call("/settings", "POST", b'{"recording": {"start": "manual"}}')
+        assert code == 200 and json.loads(call("/settings")[1])["recording"]["start"] == "manual"
+        assert json.loads(call("/status")[1])["recording_mode"]["start"] == "manual"
+        assert call("/settings", "POST", b'{"recording": {"start": "always"}}')[0] == 200
         code, body = call("/new_file", "POST", b"{}")
         assert code == 200 and json.loads(body)["finished"] == active
         assert call(f"/delete/{active}", "POST", b"{}")[0] == 204 and not (main.LOG_DIR / active).exists()

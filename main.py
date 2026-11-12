@@ -119,7 +119,26 @@ DEFAULT_PERIODS = {path: period for path, period, _ in POLLS}
 periods = dict(DEFAULT_PERIODS)  # what the user set, in seconds
 MIN_PERIOD, MAX_PERIOD = 0.1, 3600
 SETTINGS = LOG_DIR / "settings.json"
-auto_record = True  # record from the moment the logger starts; off, it waits for Start on the page
+# When recording starts and stops on its own. "always": from the moment the logger starts. "armed": when the vehicle
+# arms, and, with stop_on_disarm, stops disarm_delay_s after it disarms. "manual": only with Start on the page.
+START_MODES = ("always", "armed", "manual")
+DELAY_UNITS = {"seconds": 1, "minutes": 60, "hours": 3600}  # how the page shows the delay
+MAX_DISARM_DELAY_S = 7 * 24 * 3600
+DEFAULT_RECORDING = {"start": "always", "stop_on_disarm": False, "disarm_delay_s": 0, "disarm_delay_unit": "minutes"}
+recording_mode = dict(DEFAULT_RECORDING)
+
+
+def recording_error(mode) -> str | None:
+    if mode["start"] not in START_MODES:
+        return f"start must be one of {', '.join(START_MODES)}"
+    if not isinstance(mode["stop_on_disarm"], bool):
+        return "stop_on_disarm must be true or false"
+    delay = mode["disarm_delay_s"]
+    if type(delay) not in (int, float) or not 0 <= delay <= MAX_DISARM_DELAY_S:
+        return f"disarm_delay_s must be a number of seconds from 0 to {MAX_DISARM_DELAY_S}"
+    if mode["disarm_delay_unit"] not in DELAY_UNITS:
+        return f"disarm_delay_unit must be one of {', '.join(DELAY_UNITS)}"
+    return None
 
 
 def valid_period(value) -> bool:
@@ -127,7 +146,6 @@ def valid_period(value) -> bool:
 
 
 def load_settings() -> None:
-    global auto_record
     try:
         saved = json.loads(SETTINGS.read_text())
     except (OSError, ValueError):
@@ -136,32 +154,92 @@ def load_settings() -> None:
         return
     if isinstance(polls := saved.get("poll_periods"), dict):
         periods.update({path: v for path, v in polls.items() if path in DEFAULT_PERIODS and valid_period(v)})
-    if isinstance(saved.get("auto_record"), bool):
-        auto_record = saved["auto_record"]
+    mode = saved.get("recording")
+    if saved.get("auto_record") is False:  # v0.8.6 had only this switch
+        mode = {"start": "manual"}
+    if isinstance(mode, dict) and not recording_error(merged := {**DEFAULT_RECORDING, **mode}):
+        recording_mode.update(merged)
 
 
-def save_settings(poll_periods: dict, auto: bool) -> str | None:
+def save_settings(poll_periods: dict, mode: dict) -> str | None:
     """Returns an error, if any. A power cut leaves the old settings or the new ones, never half."""
     changed = {path: v for path, v in poll_periods.items() if v != DEFAULT_PERIODS[path]}
     temporary = SETTINGS.with_suffix(".tmp")
     try:
-        temporary.write_text(json.dumps({"auto_record": auto, "poll_periods": changed}, indent=2))
+        temporary.write_text(json.dumps({"recording": mode, "poll_periods": changed}, indent=2))
         temporary.replace(SETTINGS)
     except OSError as error:
         return f"could not save the settings: {error}"
     return None
 
 
-def set_auto_record(value) -> str | None:
-    """Only for the next start of the logger: what is recording now goes on, or stays stopped."""
-    global auto_record
-    if not isinstance(value, bool):
-        return "auto_record must be true or false"
-    if error := save_settings(periods, value):
+def set_recording_mode(new) -> str | None:
+    """Applies from the next start of the logger, arm or disarm: what is recording now goes on, or stays stopped.
+    Except that with "armed", a vehicle armed right now starts recording."""
+    global armed, disarm_stop_at
+    if not isinstance(new, dict) or not new.keys() <= DEFAULT_RECORDING.keys():
+        return f"expected an object with any of {', '.join(DEFAULT_RECORDING)}"
+    mode = {**recording_mode, **new}
+    if (error := recording_error(mode)) or (error := save_settings(periods, mode)):
         return error
-    auto_record = value
-    rec.event(f"automatic recording {'enabled' if value else 'disabled'} for the next starts")
+    recording_mode.update(mode)
+    armed = disarm_stop_at = None  # the next HEARTBEAT is taken as an arm, if the vehicle is armed
+    rec.event(f"recording mode changed: {json.dumps(mode)}")
     return None
+
+
+# Following the autopilot's arming, for the "armed" mode. Set from its HEARTBEAT on the event loop, acted on in
+# follow_arming(), which starts and stops files in a thread, since closing one waits for the card.
+armed: bool | None = None  # None until the first HEARTBEAT, and after a mode change
+start_on_arm = False
+disarm_stop_at: float | None = None  # monotonic time recording stops, after a disarm
+arming_changed = asyncio.Event()
+
+
+def on_heartbeat(system: int, message: dict) -> None:
+    global armed, start_on_arm, disarm_stop_at
+    if message.get("autopilot", {}).get("type") == "MAV_AUTOPILOT_INVALID":  # a GCS or a companion, not the vehicle
+        return
+    if autopilot_system is not None and system != autopilot_system:
+        return
+    now = bool(message.get("base_mode", {}).get("bits", 0) & 128)  # MAV_MODE_FLAG_SAFETY_ARMED
+    if now == armed:
+        return
+    previous, armed = armed, now
+    if recording_mode["start"] != "armed":
+        return
+    if now:
+        disarm_stop_at, start_on_arm = None, True
+    elif previous and recording_mode["stop_on_disarm"]:  # not on the first HEARTBEAT: only a disarm seen happening
+        disarm_stop_at = time.monotonic() + recording_mode["disarm_delay_s"]
+    arming_changed.set()
+
+
+def apply_arming() -> None:
+    global start_on_arm, disarm_stop_at
+    with rec.lock:
+        if start_on_arm:
+            start_on_arm = False
+            if armed and rec.stopped:
+                try:
+                    rec.restart("because the vehicle armed")
+                    rec.errors.pop("arming", None)
+                except Exception as error:  # a full or failing card: tried again every second while armed
+                    start_on_arm = True
+                    rec.errors["arming"] = f"could not start recording at the arm: {error}"
+        if disarm_stop_at is not None and (rec.closed or armed):  # stopped by hand meanwhile, or armed again
+            disarm_stop_at = None
+        if disarm_stop_at is not None and time.monotonic() >= disarm_stop_at:
+            disarm_stop_at = None
+            rec.stop("because the vehicle disarmed")
+
+
+async def follow_arming() -> None:
+    while True:
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(arming_changed.wait(), 1)  # the delay after a disarm runs out without a message
+        arming_changed.clear()
+        await asyncio.to_thread(apply_arming)
 
 
 def apply_periods(new) -> str | None:
@@ -174,7 +252,7 @@ def apply_periods(new) -> str | None:
         if not valid_period(value):
             return f"the period of {path} must be a number of seconds from {MIN_PERIOD} to {MAX_PERIOD}"
     merged = {**periods, **new}
-    if error := save_settings(merged, auto_record):  # nothing changes, so the current file's poll_periods_s stays true
+    if error := save_settings(merged, recording_mode):  # nothing changes, so the current file's poll_periods_s stays true
         return error
     periods.update(new)
     changed = {path: v for path, v in merged.items() if v != DEFAULT_PERIODS[path]}
@@ -256,15 +334,15 @@ class Recorder:
         self.dropped = 0  # messages not recorded: while paused for disk space or after a write error
         self.paused = False
         self.closed = False  # the file is finished and nothing is written: the logger is stopping, or stopped
-        self.stopped = False  # stopped from the page, until started again from there
+        self.stopped = False  # stopped from the page or by the recording mode, until started again
+        self.unrecorded = 0  # messages that arrived while stopped: not a loss, so not in dropped
         self.write_error: str | None = None  # the writer failed: nothing is recorded until a new file opens
         self.errors: dict[str, str] = {}  # what is failing, shown on the page
         self.links: dict[str, str] = {}
         self.seen: dict[str, float] = {}  # monotonic time of the last message from each websocket
-        if not record:  # automatic recording is off: stopped until Start, and no empty file meanwhile
+        if not record:  # waiting for Start or an arm, without an empty file meanwhile
             self.path, self.file, self.writer = LOG_DIR / "none", None, None
             self.closed = self.stopped = True
-            self.dropped_at_stop = 0
             self._reset()
             return
         try:
@@ -365,17 +443,17 @@ class Recorder:
                        f"messages, plus the last {FLUSH_S} s before the error")
         return True
 
-    def stop(self) -> None:
-        """The emergency stop on the page: the file is finished whole and nothing more is written, not even to a new
-        file, until restart(). Not kept across restarts of the logger: those follow auto_record."""
+    def stop(self, reason: str = "from the page") -> None:
+        """The file is finished whole and nothing more is written, not even to a new file, until restart(). Not kept
+        across restarts of the logger: those follow recording_mode."""
         with self.lock:
             if self.closed:
                 raise RuntimeError("not recording")
-            self.event("recording stopped from the page")
+            self.event(f"recording stopped {reason}")
             self.finish()
-            self.stopped, self.dropped_at_stop = True, self.dropped
+            self.stopped, self.unrecorded = True, 0
 
-    def restart(self) -> None:
+    def restart(self, reason: str = "from the page") -> None:
         """Recording again after stop(), in a new file. Raises, and stays stopped, if the file can't be created."""
         with self.lock:
             if not self.stopped:
@@ -386,8 +464,7 @@ class Recorder:
             self.errors.pop("recording", None)
             self._reset()
             self.start()
-            self.event(f"recording started from the page, after {self.dropped - self.dropped_at_stop} messages "
-                       f"not recorded while stopped")
+            self.event(f"recording started {reason}, after {self.unrecorded} messages not recorded while stopped")
 
     def resume(self) -> None:
         """Recording again after a pause for disk space: what is only written on change is written again, so the file
@@ -404,6 +481,9 @@ class Recorder:
 
     def _write(self, topic: str, data, mono: int | None) -> None:
         """Records `data` as happening now, or at `mono` (our CLOCK_MONOTONIC) when the sender stamped it."""
+        if self.stopped:
+            self.unrecorded += 1
+            return
         if self.paused or self.closed or self.write_error:
             self.dropped += 1
             return
@@ -621,6 +701,8 @@ def handle_mavlink(packet: dict) -> None:
         mavlink_sequence[sender[0]] = sequence
     if message["type"] == "SYSTEM_TIME" and header["component_id"] == 1:
         autopilot_time(message, header["system_id"])
+    elif message["type"] == "HEARTBEAT" and header["component_id"] == 1:
+        on_heartbeat(header["system_id"], message)
 
 
 last_kernel_sequence = -1
@@ -1071,7 +1153,7 @@ def ingest(state: dict, message) -> dict | None:
             return refuse(state, "mono_ns must be our CLOCK_MONOTONIC in ns, from a sync, not in the future and "
                                  "not over 10 minutes old")
         if rec.stopped or rec.paused or rec.write_error:
-            return refuse(state, "recording is stopped from the page" if rec.stopped else
+            return refuse(state, "recording is stopped" if rec.stopped else
                           "recording is paused: " + (rec.write_error or "disk full"))
         # Always under the sender's own namespace, so nobody can write into /time or /mavlink.
         rec.write(f"/extensions/{state['name']}/{'/'.join(parts)[:200]}", message.get("data"), mono=mono)
@@ -1209,7 +1291,9 @@ def status() -> dict:
         "topics": len(rec.channels),
         "paused": rec.paused,
         "stopped": rec.stopped,
-        "auto_record": auto_record,
+        "recording_mode": recording_mode,
+        "armed": armed,
+        "stops_in_s": None if disarm_stop_at is None else max(0.0, disarm_stop_at - now),
         "write_error": rec.write_error,
         "dropped": rec.dropped,
         "links": rec.links,
@@ -1257,7 +1341,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/register_service":
             self.reply_json(200, REGISTER_SERVICE)
         elif path == "/settings":
-            self.reply_json(200, {"min": MIN_PERIOD, "max": MAX_PERIOD, "auto_record": auto_record, "polls": [
+            self.reply_json(200, {"min": MIN_PERIOD, "max": MAX_PERIOD, "recording": recording_mode, "polls": [
                 {"path": p, "period": periods[p], "default": d, "always": a} for p, d, a in POLLS]})
         elif path == "/status":
             self.reply_json(200, status())
@@ -1323,8 +1407,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length)) if 0 < length <= 2**16 else None
             except ValueError:
                 body = None
-            if isinstance(body, dict) and "auto_record" in body and "poll_periods" not in body:
-                error = set_auto_record(body["auto_record"])
+            if isinstance(body, dict) and "recording" in body and "poll_periods" not in body:
+                error = set_recording_mode(body["recording"])
             else:
                 error = apply_periods(body.get("poll_periods") if isinstance(body, dict) else None)
             self.reply_json(400 if error else 200, {"error": error, "file": rec.path.name})
@@ -1360,18 +1444,20 @@ async def main() -> None:
     # log scan) in asyncio's default pool of cpus + 4 threads.
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(len(POLLS) + 8))
     load_settings()
-    rec = Recorder(clock, record=auto_record)
-    if auto_record:
+    always = recording_mode["start"] == "always"
+    rec = Recorder(clock, record=always)
+    if always:
         rec.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
-    print(f"Recording to {rec.path}" if auto_record else "Automatic recording is off, waiting for Start",
+    print(f"Recording to {rec.path}" if always else f"Waiting for {'an arm' if recording_mode['start'] == 'armed' else 'Start'}",
           f"web interface on port {PORT}", sep=", ", flush=True)
 
     sources = {f"poll {path}": (lambda p=path, a=always: poll(p, a)) for path, _, always in POLLS}
     sources["mavlink2rest"] = lambda: websocket("mavlink2rest", "/mavlink2rest/ws/mavlink?filter=.*", handle_mavlink)
     sources["kernel"] = lambda: websocket("kernel", "/system-information/ws/kernel_buffer", handle_kernel)
     sources["linux clock"] = watch_linux_clock
+    sources["arming"] = follow_arming
     sources["service logs"] = tail_service_logs
     sources["container logs"] = follow_container_logs
     sources["ingest"] = serve_ingest
