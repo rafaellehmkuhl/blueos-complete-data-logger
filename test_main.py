@@ -1,16 +1,25 @@
-"""Run with: python test_main.py (needs the packages from requirements.txt)."""
+"""Run with: python test_main.py (needs the packages from requirements.txt). Each test is one promise of the README
+or one failure the logger must survive."""
 
+import asyncio
 import io
 import json
 import os
+import shutil
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 os.environ["LOG_DIR"] = tempfile.mkdtemp()
 import main  # noqa: E402
+import websockets  # noqa: E402
 from mcap.reader import make_reader  # noqa: E402
 
 HOUR = 3_600_000_000_000
+CPU = "/system-information/system/cpu"
 
 
 def messages(data: bytes) -> list:
@@ -18,13 +27,43 @@ def messages(data: bytes) -> list:
     return [(c.topic, m.log_time, json.loads(m.data)) for _, c, m in reader.iter_messages(log_time_order=False)]
 
 
-def test() -> None:
+def metadata(data: bytes) -> dict:
+    return {m.name: m.metadata for m in make_reader(io.BytesIO(data)).iter_metadata()}
+
+
+def topic(raw: list, name: str) -> list:
+    return [e for t, _, e in raw if t == name]
+
+
+def fresh() -> None:
+    """A new recording with the Linux clock as the only reference, as at boot without internet."""
+    main.clock.shift = main.clock.start_shift = main.clock.linux = main.linux_shift()
+    main.clock.source, main.clock.syncs = "linux_unsynced", 0
+    main.autopilot_shifts.clear()
+    main.autopilot_system = None
+    main.rec = main.Recorder(main.clock)
+    main.rec.start()
+
+
+class Failing:
+    """A card that returns EIO."""
+
+    def write(self, data):
+        raise OSError(5, "Input/output error")
+
+    def flush(self):
+        raise OSError(5, "Input/output error")
+
+    def tell(self):
+        return 0
+
+
+def test_recording() -> None:
     assert main.redact({"user": "a", "Password": "x", "nested": [{"api_key": 1, "ok": 2}]}) == \
         {"user": "a", "Password": "<redacted>", "nested": [{"api_key": "<redacted>", "ok": 2}]}
     assert main.parse_docker_line("2026-11-11T19:00:00.5Z hello world") == ("hello world", 1794423600_500000000)
 
-    main.clock.source = "linux_unsynced"
-    main.rec = main.Recorder(main.clock)
+    fresh()
     main.rec.write("/a", {"v": 1})
     assert main.rec.sync("autopilot", main.clock.shift + HOUR)  # the Linux clock was an hour behind
     main.rec.write("/a", {"v": 2})
@@ -52,18 +91,18 @@ def test() -> None:
     main.rec.finish()
 
     raw = messages(main.rec.path.read_bytes())
-    a = [e for topic, _, e in raw if topic == "/a"]
+    a = topic(raw, "/a")
     assert [e["time_synced_externally"] for e in a] == [False, True]
     assert a[1]["corrected_ns"] - a[1]["mono_ns"] - (a[0]["corrected_ns"] - a[0]["mono_ns"]) == HOUR
     # The recorded log_time never jumps when the reference changes: it is mono_ns plus one constant.
     assert len({t - e["mono_ns"] for _, t, e in raw}) == 1
-    logged = [(e["data"]["line"], e["data"]["backfill"]) for topic, _, e in raw if topic == "/blueos/logs/svc"]
+    logged = [(e["data"]["line"], e["data"]["backfill"]) for e in topic(raw, "/blueos/logs/svc")]
     # "second" started before the logger did, so it is backfill even though it was finished later
     assert logged == [("first", True), ("second", True), ("third", False)], logged
 
-    ext = [e for topic, _, e in raw if topic == "/extensions/My_Ext/time/sync"]
+    ext = topic(raw, "/extensions/My_Ext/time/sync")
     assert len(ext) == 1 and ext[0]["mono_ns"] == happened and ext[0]["received_mono_ns"] > happened
-    assert sum(topic == "/time/sync" for topic, _, _ in raw) == 1, "a client can't write into /time"
+    assert len(topic(raw, "/time/sync")) == 2, "a client can't write into /time"
 
     out = io.BytesIO()
     main.export(main.rec.path, out)
@@ -72,47 +111,501 @@ def test() -> None:
     for _, log_time, envelope in synced:  # every message, also the one before the sync, gets the final reference
         assert envelope["time_synced_externally"] and envelope["time_source"] == "autopilot"
         assert log_time == envelope["corrected_ns"] == envelope["mono_ns"] + main.clock.shift
+    summary = make_reader(io.BytesIO(out.getvalue())).get_summary()
+    topics = [c.topic for c in summary.channels.values()]
+    assert len(topics) == len(set(topics)), "every topic once in the download"
 
-    # A new file on request: the old one is closed whole, the new one is synchronized from its first message.
-    main.rec = main.Recorder(main.clock)
-    main.rec.start()
+
+def test_new_file() -> None:
+    """A new file on request: the old one is closed whole, the new one is synchronized from its first message."""
+    fresh()
     main.rec.write("/a", {"v": 3})
     generation = main.rec.generation
+    main.rec.sync("autopilot", main.clock.shift + HOUR)
     finished = main.rec.rotate()
     main.rec.write("/a", {"v": 4})
     main.rec.finish()
     assert main.rec.generation == generation + 1 and main.rec.path != finished
     old = messages(finished.read_bytes())  # readable as a finished file, with its summary
-    assert [e["data"]["v"] for topic, _, e in old if topic == "/a"] == [3]
+    assert [e["data"]["v"] for e in topic(old, "/a")] == [3]
     new = messages(main.rec.path.read_bytes())
     assert new[0][0] == "/time/sync" and new[0][2]["data"]["file_start"] and new[0][2]["time_synced_externally"]
-    assert [e["data"]["v"] for topic, _, e in new if topic == "/a"] == [4]
+    assert [e["data"]["v"] for e in topic(new, "/a")] == [4]
+    # As recorded, each file is placed at the best time known when it started, not at the clock of the first file.
+    assert all(t == e["corrected_ns"] for _, t, e in new)
+    assert "recording" in metadata(finished.read_bytes()) and "recording" in metadata(main.rec.path.read_bytes())
 
-    # Poll periods: checked as a whole, saved, applied in a new file that records them.
-    main.rec = main.Recorder(main.clock)
-    main.rec.start()
-    cpu = "/system-information/system/cpu"
-    before = main.rec.path
-    assert main.apply_periods({cpu: 0.5, "/nope": 1})  # an error, and nothing applied
-    assert main.apply_periods({cpu: 0}) and main.apply_periods({cpu: True}) and main.apply_periods({cpu: "1"})
-    assert main.periods[cpu] == 1 and main.rec.path == before
-    assert main.apply_periods({cpu: 0.5}) is None
-    assert main.periods[cpu] == 0.5 and main.rec.path != before
-    assert json.loads(main.SETTINGS.read_text()) == {"poll_periods": {cpu: 0.5}}
-    main.periods[cpu] = 1
-    main.load_settings()
-    assert main.periods[cpu] == 0.5
+
+def test_concurrent_rotations() -> None:
+    """Two clients pressing New file while threads write: no error, and every file whole with its start metadata."""
+    fresh()
+    errors, stop = [], threading.Event()
+
+    def writer() -> None:
+        while not stop.is_set():
+            main.rec.write("/w", {"x": 1})
+
+    def rotator() -> None:
+        try:
+            for _ in range(20):
+                main.rec.rotate()
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=writer) for _ in range(2)] + [threading.Thread(target=rotator) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads[2:]:
+        t.join()
+    stop.set()
+    for t in threads[:2]:
+        t.join()
     main.rec.finish()
-    reader = make_reader(io.BytesIO(main.rec.path.read_bytes()))
-    assert {m.name: m.metadata for m in reader.iter_metadata()}["poll_periods_s"][cpu] == "0.5"
+    assert not errors, errors
+    for path in Path(os.environ["LOG_DIR"]).glob("*.mcap"):
+        assert "recording" in metadata(path.read_bytes()), path
 
-    # The disk: recording stops at 95% used, or under the minimum free, whichever comes first.
+
+def test_poll_periods() -> None:
+    """Checked as a whole, saved, applied in a new file that records them. A failed save changes nothing."""
+    fresh()
+    before = main.rec.path
+    assert main.apply_periods({CPU: 0.5, "/nope": 1})  # an error, and nothing applied
+    assert main.apply_periods({CPU: 0}) and main.apply_periods({CPU: True}) and main.apply_periods({CPU: "1"})
+    assert main.periods[CPU] == 1 and main.rec.path == before
+    assert main.apply_periods({CPU: 0.5}) is None
+    assert main.periods[CPU] == 0.5 and main.rec.path != before
+    assert json.loads(main.SETTINGS.read_text()) == {"poll_periods": {CPU: 0.5}}
+    main.periods[CPU] = 1
+    main.load_settings()
+    assert main.periods[CPU] == 0.5
+
+    current = main.rec.path
+    main.SETTINGS.with_suffix(".tmp").mkdir()  # can't be written
+    error = main.apply_periods({CPU: 2})
+    main.SETTINGS.with_suffix(".tmp").rmdir()
+    assert error and "could not save" in error and main.periods[CPU] == 0.5 and main.rec.path == current
+    main.rec.finish()
+    assert metadata(main.rec.path.read_bytes())["poll_periods_s"][CPU] == "0.5"
+    main.periods[CPU] = 1
+
+
+def test_disk_full() -> None:
+    """Recording stops at 95% used, or under the minimum free, whichever comes first."""
     usage = main.shutil._ntuple_diskusage
     assert not main.disk_full(usage(total=100 * 2**30, used=90 * 2**30, free=10 * 2**30))
     assert main.disk_full(usage(total=100 * 2**30, used=95 * 2**30, free=5 * 2**30))
     assert main.disk_full(usage(total=4 * 2**30, used=3.5 * 2**30, free=0.5 * 2**30))
-    print("ok")
+
+
+def test_pause_and_resume() -> None:
+    """While paused nothing is written and it is counted; after it, state that is written on change is current again."""
+    fresh()
+    main.rec.paused = True
+    main.rec.write("/a", 1)
+    generation = main.rec.generation
+    assert main.rec.dropped == 1
+    client = {"name": "c"}
+    assert main.ingest(client, {"op": "log", "topic": "t", "data": 1})["op"] == "error", "the client is told"
+    assert "ingest c" in main.rec.errors
+    main.rec.resume()
+    assert not main.rec.paused and main.rec.generation == generation + 1  # polls write their state again
+    assert main.ingest(client, {"op": "log", "topic": "t", "data": 1}) is None and "ingest c" not in main.rec.errors
+    main.rec.finish()
+    raw = messages(main.rec.path.read_bytes())
+    assert not topic(raw, "/a")
+    assert topic(raw, "/time/sync")[-1]["data"]["resumed"], "the reference is written again"
+
+
+def test_write_error() -> None:
+    """The card fails: recording stops visibly, the broken writer is never used again, and a new file takes over."""
+    fresh()
+    main.rec.write("/a", {"v": "before"})
+    assert main.rec.flush() is not None
+    first = main.rec.path
+    main.rec.writer._Writer__stream = Failing()
+    main.rec.write("/a", {"v": "lost"})
+    assert main.rec.flush() is None
+    assert main.rec.write_error and "recording" in main.rec.errors
+    status = main.status()
+    assert status["write_error"] and "recording" in status["failing_endpoints"]
+    counted = main.rec.messages
+    main.rec.write("/a", {"v": "dropped"})
+    assert main.rec.messages == counted and main.rec.dropped >= 1, "nothing goes into the broken writer"
+    try:
+        main.rec.rotate()
+        raise AssertionError("rotate must refuse while the writer is broken")
+    except RuntimeError:
+        pass
+
+    assert main.rec.recover()
+    assert main.rec.path != first and not main.rec.write_error and "recording" not in main.rec.errors
+    main.rec.write("/a", {"v": "after"})
+    main.rec.finish()
+    raw = messages(main.rec.path.read_bytes())
+    assert [e["data"]["v"] for e in topic(raw, "/a")] == ["after"]
+    assert any("after a write error" in e["data"]["event"] for e in topic(raw, "/logger/events"))
+    kept = [m for r in main.records(first, []) if isinstance(r, main.Message) for m in [json.loads(r.data)]]
+    assert any(m["data"] == {"v": "before"} for m in kept), "what was synced before the failure stays readable"
+
+
+def test_cannot_create_files() -> None:
+    """A new file can't be created: the current one keeps recording, and the caller gets the error."""
+    fresh()
+    real_open = open
+    main.open = lambda *a, **k: (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+    try:
+        main.rec.rotate()
+        raise AssertionError("rotate must raise")
+    except OSError:
+        pass
+    finally:
+        main.open = real_open
+        del main.open
+    assert main.rec.path.exists() and not main.rec.file.closed
+    main.rec.write("/a", {"v": "still recording"})
+    main.rec.finish()
+    assert topic(messages(main.rec.path.read_bytes()), "/a")[0]["data"] == {"v": "still recording"}
+
+    # At start: the page still comes up and says so, and watch_disk keeps trying.
+    main.open = lambda *a, **k: (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+    try:
+        rec = main.Recorder(main.clock)
+        rec.start()
+        rec.write("/a", 1)
+        assert rec.write_error and rec.dropped >= 1
+        assert not rec.recover()
+    finally:
+        del main.open
+    assert rec.recover() and rec.path.exists()
+    rec.finish()
+
+
+def test_topic_limit() -> None:
+    """A client inventing topics can't push the file past MCAP's 16-bit channel ids and break it for everyone."""
+    fresh()
+    limit, main.MAX_CHANNELS = main.MAX_CHANNELS, 100
+    try:
+        client = {"name": "c"}
+        for i in range(200):
+            main.ingest(client, {"op": "log", "topic": f"request/{i}", "data": i})
+        main.handle_mavlink({"header": {"system_id": 1, "component_id": 1, "sequence": 0},
+                             "message": {"type": "HEARTBEAT"}})
+        assert len(main.rec.channels) <= 101 and "topics" in main.rec.errors
+        finished = main.rec.rotate()
+        main.rec.finish()
+    finally:
+        main.MAX_CHANNELS = limit
+    raw = messages(finished.read_bytes())
+    overflow = topic(raw, "/logger/overflow")
+    assert overflow and overflow[0]["data"]["topic"].startswith("/extensions/c/request/")
+    assert sum(e["data"]["topic"].startswith("/extensions/c/") for e in overflow) + sum(
+        t.startswith("/extensions/c/") for t, _, _ in raw) == 200, "nothing lost"
+    assert any(e["data"]["topic"] == "/mavlink/1/1/HEARTBEAT" for e in overflow), "MAVLink still recorded"
+
+
+def test_flush() -> None:
+    """A power cut loses at most the last FLUSH_S seconds: after a flush, the file on the card has every message."""
+    fresh()
+    for i in range(10):
+        main.rec.write("/a", {"i": i})
+    assert main.rec.flush() is not None
+    copy = Path(tempfile.mkdtemp()) / "cut.mcap"
+    shutil.copy(main.rec.path, copy)  # what a power cut would leave
+    got = [json.loads(r.data)["data"] for r in main.records(copy, []) if isinstance(r, main.Message)]
+    assert [g["i"] for g in got if isinstance(g, dict) and "i" in g] == list(range(10))
+    main.rec.finish()
+
+
+def test_power_cut_download() -> None:
+    """A file cut by a power loss still downloads, with the reference it reached and a note of what was cut."""
+    fresh()
+    for i in range(5):
+        main.rec.write("/a", {"i": i})
+        main.rec.flush()
+    main.rec.sync("autopilot", main.clock.shift + HOUR)
+    main.rec.write("/a", {"i": 5})
+    main.rec.flush()
+    data = main.rec.path.read_bytes()
+    main.rec.finish()
+    copy = Path(tempfile.mkdtemp()) / "0001_cut.mcap"
+    copy.write_bytes(data[:-20])  # cut in the middle of the last chunk
+    out = io.BytesIO()
+    main.export(copy, out)
+    got = messages(out.getvalue())
+    assert [e["data"]["i"] for e in topic(got, "/a")] == [0, 1, 2, 3, 4]
+    assert all(e["time_source"] == "autopilot" for _, _, e in got)
+    meta = metadata(out.getvalue())
+    assert meta["time"]["source"] == "autopilot" and "export_problems" in meta
+
+
+def test_damaged_chunk() -> None:
+    """A damaged chunk in a finished file costs only its own messages, and the download says so."""
+    fresh()
+    for i in range(6):
+        main.rec.write("/a", {"i": i, "pad": "x" * 2000})
+        main.rec.flush()
+    main.rec.finish()
+    data = bytearray(main.rec.path.read_bytes())
+    chunks = make_reader(io.BytesIO(bytes(data))).get_summary().chunk_indexes
+    middle = chunks[len(chunks) // 2]
+    at = middle.chunk_start_offset + middle.chunk_length // 2
+    data[at:at + 16] = b"\xff" * 16
+    damaged = Path(tempfile.mkdtemp()) / "0001_damaged.mcap"
+    damaged.write_bytes(bytes(data))
+    out = io.BytesIO()
+    main.export(damaged, out)
+    got = [e["data"]["i"] for e in topic(messages(out.getvalue()), "/a")]
+    assert len(got) == 5 and got[-1] == 5, got
+    assert "damaged chunk" in json.dumps(metadata(out.getvalue())["export_problems"])
+
+
+def test_old_file_gets_later_sync() -> None:
+    """A file closed before the sync, in the same boot, is re-stamped with the reference reached later."""
+    fresh()
+    main.rec.write("/a", 1)
+    old = main.rec.rotate()
+    main.rec.sync("autopilot", main.clock.shift + HOUR)
+    out = io.BytesIO()
+    main.export(old, out)
+    main.rec.finish()
+    a = topic(messages(out.getvalue()), "/a")[0]
+    assert a["time_source"] == "autopilot" and a["time_synced_externally"]
+    assert a["corrected_ns"] == a["mono_ns"] + main.clock.shift
+
+
+def test_autopilot_time() -> None:
+    """The autopilot's time: the least delayed sample wins, one system only, and a set of its clock is followed."""
+    fresh()
+    truth = main.time.time_ns() - main.time.monotonic_ns() + 5 * HOUR  # what the autopilot says is 5 h ahead
+
+    def system_time(system: int, delay_ns: int, offset: int = 0) -> None:
+        unix = main.time.monotonic_ns() + truth + offset - delay_ns
+        main.handle_mavlink({"header": {"system_id": system, "component_id": 1, "sequence": 0},
+                             "message": {"type": "SYSTEM_TIME", "time_unix_usec": unix // 1000, "time_boot_ms": 1}})
+
+    system_time(1, 900_000_000)  # the first one arrives late, during a backlog
+    assert main.clock.source == "autopilot"
+    for _ in range(20):
+        system_time(1, 5_000_000)
+    assert abs(main.clock.shift - truth) < 20_000_000, (main.clock.shift - truth) / 1e6
+    syncs = main.clock.syncs
+    for _ in range(5):
+        system_time(2, 0, offset=30 * 10**9)  # another vehicle, 30 s off
+    assert main.clock.syncs == syncs and abs(main.clock.shift - truth) < 20_000_000
+    assert "SYSTEM_TIME 2" in main.rec.errors
+    system_time(1, 0, offset=HOUR)  # the autopilot's clock was set
+    assert abs(main.clock.shift - truth - HOUR) < 20_000_000
+    main.rec.finish()
+
+
+def test_mavlink_gaps() -> None:
+    fresh()
+    main.mavlink_gaps = 0
+    main.mavlink_sequence.clear()
+    for sequence in (250, 251, 254, 255, 0, 1, 200):  # lost 252 and 253; wrapping is not a loss, nor is a restart
+        main.handle_mavlink({"header": {"system_id": 1, "component_id": 1, "sequence": sequence},
+                             "message": {"type": "HEARTBEAT"}})
+    for sequence in (9, 12, 15):  # the camera manager's components share one counter: not losses
+        main.handle_mavlink({"header": {"system_id": 1, "component_id": 100, "sequence": sequence},
+                             "message": {"type": "HEARTBEAT"}})
+    assert main.mavlink_gaps == 2, main.mavlink_gaps
+    main.rec.finish()
+
+
+def test_kernel_ring_once() -> None:
+    """linux2rest sends the whole ring buffer on every connection: each kernel message is recorded once."""
+    fresh()
+    main.last_kernel_sequence = -1
+    ring = [{"sequence_number": 1, "message": "boot"}, {"sequence_number": 2, "message": "usb"}]
+    main.handle_kernel(ring)
+    main.handle_kernel(ring + [{"sequence_number": 3, "message": "new"}])  # reconnected
+    main.rec.finish()
+    assert [e["data"]["message"] for e in topic(messages(main.rec.path.read_bytes()), "/linux/kernel")] == \
+        ["boot", "usb", "new"]
+
+
+def test_invalid_numbers() -> None:
+    """NaN from a Python client is recorded as null: no JSON reader accepts NaN, so it would make the message unreadable."""
+    fresh()
+    client = {"name": "py"}
+    main.ingest(client, {"op": "log", "topic": "t", "data": {"v": float("nan"), "w": float("inf"), "ok": 1}})
+    main.rec.finish()
+    raw = main.rec.path.read_bytes()
+    for _, _, envelope in messages(raw):
+        json.dumps(envelope, allow_nan=False)
+    assert topic(messages(raw), "/extensions/py/t")[0]["data"] == {"v": None, "w": None, "ok": 1}
+
+
+def test_ingest_limits() -> None:
+    fresh()
+    client = {"name": "c"}
+    old = main.time.monotonic_ns() - 3600 * 10**9
+    assert main.ingest(client, {"op": "log", "topic": "t", "mono_ns": old})["op"] == "error", "an hour old"
+    assert "ingest c" in main.rec.errors, "a refused message shows on the page"
+    assert main.ingest(client, {"op": "log", "topic": "t", "data": 1}) is None
+    assert "ingest c" not in main.rec.errors
+    main.rec.finish()
+    events = [e["data"]["event"] for e in topic(messages(main.rec.path.read_bytes()), "/logger/events")]
+    assert any("refusing" in e for e in events)
+
+
+async def _supervised() -> None:
+    fresh()
+    runs = []
+
+    async def flaky() -> None:
+        runs.append(1)
+        if len(runs) == 1:
+            raise RuntimeError("boom")
+        await asyncio.Event().wait()
+
+    sleep = main.asyncio.sleep
+    main.asyncio.sleep = lambda s, *a: sleep(0)  # skip the 5 s pause before a restart
+    try:
+        task = asyncio.create_task(main.supervise("flaky", flaky))
+        await sleep(0.05)
+        assert "flaky" in main.rec.errors and "boom" in main.rec.errors["flaky"], "a crash shows on the page"
+        assert len(runs) == 2 and not task.done(), "and the source runs again"
+        task.cancel()
+    finally:
+        main.asyncio.sleep = sleep
+    main.rec.finish()
+
+
+def test_supervise() -> None:
+    asyncio.run(_supervised())
+
+
+async def _websocket() -> None:
+    """A bad message costs only itself, and a link that is connected but silent shows how long it has been silent."""
+    fresh()
+    sent = asyncio.Event()
+
+    async def server(ws) -> None:
+        await ws.send(json.dumps({"header": {"system_id": 1, "component_id": 1, "sequence": 0},
+                                  "message": {"type": "HEARTBEAT"}}))
+        await ws.send(json.dumps({"unexpected": True}))
+        await ws.send("not json")
+        await ws.send(json.dumps({"header": {"system_id": 1, "component_id": 1, "sequence": 1},
+                                  "message": {"type": "HEARTBEAT"}}))
+        sent.set()
+        await ws.wait_closed()
+
+    async with websockets.serve(server, "127.0.0.1", 0) as ws_server:
+        port = ws_server.sockets[0].getsockname()[1]
+        host, main.HOST = main.HOST, f"127.0.0.1:{port}"
+        try:
+            task = asyncio.create_task(main.websocket("mavlink2rest", "/", main.handle_mavlink))
+            await sent.wait()
+            await asyncio.sleep(1.2)
+            status = main.status()
+            assert status["links"]["mavlink2rest"] == "connected"
+            assert status["idle_s"]["mavlink2rest"] >= 1, status["idle_s"]
+            assert "2 unexpected messages" in status["failing_endpoints"]["mavlink2rest"]
+            task.cancel()
+        finally:
+            main.HOST = host
+    main.rec.finish()
+    raw = messages(main.rec.path.read_bytes())
+    assert len(topic(raw, "/mavlink/1/1/HEARTBEAT")) == 2
+    assert len(topic(raw, "/logger/unparsed/mavlink2rest")) == 2
+    assert sum("mavlink2rest connected" in e["data"]["event"] for e in topic(raw, "/logger/events")) == 1
+
+
+def test_websocket() -> None:
+    asyncio.run(_websocket())
+
+
+async def _poll() -> None:
+    """Change-only state is written when it changes and in every new file; a failure is written once, and clears."""
+    fresh()
+    path = "/system-information/platform"
+    answers = [b'{"a":1}', b'{"a":1}', OSError("down"), OSError("down"), b'{"a":1}', b'{"a":2}']
+    calls = []
+
+    def fetch(p):
+        calls.append(p)
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    real, main.fetch = main.fetch, fetch
+    main.periods[path] = 0.1
+    try:
+        task = asyncio.create_task(main.poll(path, False))
+        while len(calls) < 3:
+            await asyncio.sleep(0.02)
+        assert path in main.rec.errors
+        while len(calls) < 6:
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+        assert path not in main.rec.errors
+        first = main.rec.rotate()
+        await asyncio.sleep(0.3)
+        task.cancel()
+    finally:
+        main.fetch = real
+        main.periods[path] = main.DEFAULT_PERIODS[path]
+    main.rec.finish()
+    written = [e["data"] for e in topic(messages(first.read_bytes()), "/blueos/system-information/platform")]
+    assert written == [{"a": 1}, {"error": "OSError: down"}, {"a": 1}, {"a": 2}], written
+    again = topic(messages(main.rec.path.read_bytes()), "/blueos/system-information/platform")
+    assert again and again[0]["data"] == {"a": 2}, "a new file has the current state from its start"
+
+
+def test_poll() -> None:
+    asyncio.run(_poll())
+
+
+def test_http() -> None:
+    """The API the page uses, and what it must refuse."""
+    fresh()
+    server = main.ThreadingHTTPServer(("127.0.0.1", 0), main.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def call(path, method="GET", body=None, content_type="application/json"):
+        request = urllib.request.Request(base + path, method=method, data=body,
+                                         headers={"Content-Type": content_type} if body is not None else {})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
+
+    try:
+        code, body = call("/status")
+        status = json.loads(body)
+        for key in ("file", "messages", "topics", "paused", "write_error", "dropped", "links", "idle_s",
+                    "mavlink_gaps", "failing_endpoints", "time", "version", "disk", "recordings"):
+            assert key in status, key  # what index.html reads
+        assert call("/")[0] == 200 and call("/settings")[0] == 200
+        assert call("/download/..%2Fsettings.json")[0] == 404
+        assert call("/raw/../../etc/passwd")[0] == 404
+        active = main.rec.path.name
+        assert call(f"/delete/{active}", "POST", b"{}")[0] == 404, "the file being written can't be deleted"
+        assert call("/new_file", "POST", b"{}", "text/plain")[0] == 415, "only JSON, so other sites can't post"
+        assert call("/settings", "POST", json.dumps({"poll_periods": {CPU: 0.5}}).encode(), "text/plain")[0] == 415
+        assert main.periods[CPU] == 1
+        assert call("/settings", "POST", b'{"poll_periods": {"/nope": 1}}')[0] == 400
+        code, body = call("/new_file", "POST", b"{}")
+        assert code == 200 and json.loads(body)["finished"] == active
+        assert call(f"/delete/{active}", "POST", b"{}")[0] == 204 and not (main.LOG_DIR / active).exists()
+        code, body = call(f"/raw/{main.rec.path.name}")
+        assert code == 200 and body.startswith(b"\x89MCAP")
+        assert call(f"/download/{main.rec.path.name}")[0] == 200
+        with main.exporting:  # one download at a time
+            assert call(f"/download/{main.rec.path.name}")[0] == 503
+    finally:
+        server.shutdown()
+        main.rec.finish()
 
 
 if __name__ == "__main__":
-    test()
+    for name, test in list(globals().items()):
+        if name.startswith("test_"):
+            test()
+            print("ok", name, flush=True)
+    print("ok")

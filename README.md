@@ -16,7 +16,8 @@ Targets BlueOS 1.4.x. Video streams are not recorded, only their configuration.
 - **No more space than it needs.** Large state, like the bag of holding, is written only when it changes, and small recurring data, like CPU and temperature, is written every poll. The file is compressed. The page shows how fast the file grows and how long until the disk limit; recording pauses at 95% disk use so the vehicle never runs out of space.
 - **Other services can log into it.** Any extension or topside service can send its own data over a WebSocket, synced to the same clock, and it lands in the same file.
 - **Record what matters.** Start a new file the moment the useful part begins, and set how often each service is polled.
-- **Safe for the vehicle.** It only reads from BlueOS, a power cut loses at most the last chunk, and a clock step can't crash it or reorder its data.
+- **Safe for the vehicle.** It only reads from BlueOS, a power cut loses at most the last 5 seconds, and a clock step can't crash it or reorder its data.
+- **Never fails silently.** A service that goes down, a link that stays connected but goes quiet, a source that crashes, a failing SD card: each keeps everything else recording, shows on the page, is written into the file, and recovers on its own. See [When something fails](#when-something-fails).
 
 ## What is recorded
 
@@ -33,6 +34,8 @@ Targets BlueOS 1.4.x. Video streams are not recorded, only their configuration.
 | `/docker/logs/<container>` | every container, BlueOS core and all extensions, through BlueOS's read-only Docker proxy, from boot (`backfill: true` for lines from before the logger started) | as written |
 | `/time/linux_clock_set`, `/time/linux_ntp`, `/time/sync` | the clock itself (see below) | on change |
 | `/logger/events` | the logger itself: connections, pauses, crashes | on change |
+| `/logger/unparsed/<source>` | a message a source sent that the logger didn't understand, kept as it came | as it arrives |
+| `/logger/overflow` | messages of new topics once a file has 10,000 topics (see below) | as it arrives |
 
 A service that stops answering is recorded too: its topic gets `{"error": "..."}` until it comes back.
 
@@ -59,9 +62,9 @@ Every message is wrapped like this, the same model ArduPilot uses in its datafla
 
 ### Download: one file, all of it synchronized
 
-**Download** on the extension page gives every message of the run the best reference the run reached, including messages recorded before the sync. That is possible because `mono_ns` never jumps within a boot, so one shift is right for all of them. In that file `corrected_ns` is the MCAP `log_time`, every message carries the same `time_synced_externally` and `time_source`, and the `time` metadata says which reference was used. This is the file to analyze.
+**Download** on the extension page gives every message of the run the best reference the run reached, including messages recorded before the sync. That is possible because `mono_ns` never jumps within a boot, so one shift is right for all of them. For the same reason, a file closed before the sync (with New file, say) gets the better reference reached later in the same boot. In that file `corrected_ns` is the MCAP `log_time`, every message carries the same `time_synced_externally` and `time_source`, and the `time` metadata says which reference was used. This is the file to analyze.
 
-**Download as recorded**, in the menu next to Download, gives the file exactly as it was written, without that correction: messages from before the clock sync keep the absolute time the vehicle believed then. There `corrected_ns` is the best reference known at the moment of each message, and the MCAP `log_time` is `mono_ns` placed at the wall time of the start, so it never jumps and never reorders even when the clock is stepped. MCAP readers sort by `log_time`, so a wall-clock `log_time` would put stepped data in the wrong place.
+**Download as recorded**, in the menu next to Download, gives the file exactly as it was written, without that correction: messages from before the clock sync keep the absolute time the vehicle believed then. There `corrected_ns` is the best reference known at the moment of each message, and the MCAP `log_time` is `mono_ns` placed at the best time known when the file started, so it never jumps and never reorders even when the clock is stepped. MCAP readers sort by `log_time`, so a wall-clock `log_time` would put stepped data in the wrong place.
 
 ### Clock records
 
@@ -73,7 +76,7 @@ Nothing in the logger reads the wall clock to measure time or name files it depe
 
 ## Using it
 
-The extension page shows the recording live (message rate, topics, the corrected UTC clock, whether the time is synchronized externally and from which source, and any endpoint that is failing) and lists recordings, which you can download with the time correction applied to the whole run, or as recorded from the menu next to Download (the active one too, up to its last written chunk) or delete once finished.
+The extension page shows the recording live (message rate, topics, the corrected UTC clock, whether the time is synchronized externally and from which source, and any endpoint that is failing) and lists recordings, which you can download with the time correction applied to the whole run, or as recorded from the menu next to Download (the active one too, up to its last 5 seconds) or delete once finished. One corrected download is prepared at a time, so the vehicle keeps a core for recording.
 
 **New file** closes the current file and continues in a new one from that moment, so a recording can start where the useful data does, with nothing to trim. The new file is complete on its own: it starts with the time reference in use, so it is synchronized from its first message if the vehicle already was, and the state of every service is written again at its start. The same is available as `POST /new_file`.
 
@@ -81,7 +84,24 @@ The extension page shows the recording live (message rate, topics, the corrected
 
 Recording pauses while the disk is over 95% full or has less than 1 GB free, so the vehicle never runs out of space, and resumes on its own. The page shows how fast the file grows and, at that rate, how long until the disk reaches the limit. An hour takes roughly 50 MB.
 
-If the vehicle loses power, the file has no index and the last chunk (up to 1 MB) is lost. `mcap recover <file>` rebuilds the rest.
+If the vehicle loses power, the file has no index and the last few seconds are lost: what is in memory is written and synced to the card every 5 seconds. Download still works on such a file, and `mcap recover <file>` rebuilds its index for other tools.
+
+## When something fails
+
+The logger is meant to be trusted, so no failure stops it quietly. Each case below keeps every other source recording, shows on the page (in the list of what is failing, the source chips or the state badge), is written into the file, and recovers on its own.
+
+| What happens | What the logger does |
+|---|---|
+| A BlueOS service stops answering, or answers with an error | Its topic gets `{"error": "..."}`, it is listed as failing, and it is cleared and recorded again when it answers. Polls run in their own threads, so a stalled service never delays the others. |
+| BlueOS core restarts | The links show *reconnecting*, and MAVLink and kernel messages are recorded again within 2 s of it being back. |
+| MAVLink is connected but nothing arrives (autopilot off, serial link lost) | The MAVLink chip turns yellow after 5 s and says for how long. Messages the autopilot numbered but that never arrived are counted too. |
+| A source sends a message the logger doesn't understand | Kept in `/logger/unparsed/<source>`; the connection carries on. |
+| Part of the logger crashes | That part restarts after 5 s, the crash is in `/logger/events` and on the page, and everything else keeps recording. |
+| The SD card fails to write (I/O error, read-only remount) | The page shows **NOT RECORDING** with the error. The file is never written again after a failure, so what it already has stays readable; a new file is tried every 10 s, and recording continues in it as soon as the card allows. |
+| The disk is almost full | Recording pauses at 95% use or under 1 GB free, and resumes on its own. On resume, every state that is only written on change is written again. |
+| An extension creates topics without end (an id in the name) | Past 10,000 topics in one file, new topics go to `/logger/overflow`, still recorded, instead of breaking the file. |
+| A chunk of a finished file is damaged | Download skips that chunk only, and says what was skipped in the file's `export_problems` metadata. |
+| The extension is stopped or updated | The file is closed whole within a second of the stop, well before Docker's 10 s limit. |
 
 ## Logging from other services and extensions
 
@@ -101,7 +121,7 @@ Stamp each message with **our** monotonic time, at the moment it happened, not w
 
 Monotonic, not corrected time, because it never jumps: whatever happens to the clocks later, the logger maps it to UTC on download like everything else. An extension on the same vehicle shares the kernel's monotonic clock (Docker gives containers no offset), so its offset comes out near zero; the sync still guards against a container with a time namespace offset, and it is what makes a service on another computer, like the topside, work too.
 
-Messages land on `/extensions/<name>/<topic>`, with `received_mono_ns` next to `mono_ns`; a client can't write outside its own namespace. `mono_ns` in the future (beyond one second) is refused. `example_client.py` does all of this in about 40 lines.
+Messages land on `/extensions/<name>/<topic>`, with `received_mono_ns` next to `mono_ns`; a client can't write outside its own namespace. `mono_ns` in the future (beyond one second) or over 10 minutes old is refused, and so is everything while recording is paused; each refusal gets an `error` reply and shows on the page. `NaN` and `Infinity`, which no JSON reader accepts, are recorded as `null`. `example_client.py` does all of this in about 40 lines.
 
 ## Settings
 
@@ -111,6 +131,7 @@ Environment variables, all optional: `MAX_DISK_USE_PERCENT` (default `95`), `MIN
 
 ```sh
 pip install -r requirements.txt
-python test_main.py
+python test_main.py  # unit tests: each README promise and each failure above
+python test_e2e.py   # the real logger against a fake BlueOS, ~30 s
 docker build -t complete-data-logger . && docker run --rm -e BLUEOS_HOST=<vehicle ip> -p 9650:9650 complete-data-logger
 ```

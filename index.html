@@ -72,6 +72,7 @@
   }
   .state.paused { background: var(--warn-soft); color: var(--warn); }
   .state.offline { background: var(--surface-2); color: var(--muted); }
+  .state.error { background: var(--rec-soft); color: var(--rec); }
   .rec-dot { position: relative; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
   .state:not(.paused):not(.offline) .rec-dot { animation: blink 1.6s ease-in-out infinite; }
   .state:not(.paused):not(.offline) .rec-dot::after {
@@ -86,6 +87,7 @@
     border-radius: var(--radius); background: var(--warn-soft); color: var(--warn); font-weight: 550;
   }
   .banner.show { display: flex; animation: rise .35s ease both; }
+  .banner.bad { background: var(--rec-soft); color: var(--rec); }
 
   /* Cards */
   .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
@@ -330,6 +332,10 @@
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
     Lost contact with the logger. Retrying…
   </div>
+  <div class="banner bad" id="write-error" role="alert">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <span id="write-error-text"></span>
+  </div>
 
   <div class="grid">
     <section class="card span-7" aria-labelledby="h-now">
@@ -347,7 +353,7 @@
         <div class="stat" data-tip="Messages per second, averaged over the last few seconds."><span class="value num" id="rate">–</span><span class="label">per second</span></div>
         <div class="stat growth" id="growth-tile" data-tip="How fast the file grows, averaged over the last 30 seconds."><span class="value num" id="growth">–</span><span class="label">file growth</span></div>
         <div class="stat" data-tip="Topics in the file, like &lt;code&gt;/mavlink/1/1/ATTITUDE&lt;/code&gt; or &lt;code&gt;/docker/logs/core&lt;/code&gt;."><span class="value num" id="topics">–</span><span class="label">topics</span></div>
-        <div class="stat" data-tip="Messages dropped because the disk had less free space than the minimum. Recording resumes on its own."><span class="value num" id="dropped">–</span><span class="label">dropped</span></div>
+        <div class="stat" data-tip="Messages not recorded, while the disk was too full or writing to the card failed. Recording resumes on its own."><span class="value num" id="dropped">–</span><span class="label">dropped</span></div>
       </div>
       <svg class="spark" id="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true">
         <path class="area" id="spark-area"/><path class="line" id="spark-line"/>
@@ -431,6 +437,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+// The logger only takes JSON posts, which a page on another site can't send to it.
+const JSON_POST = { "Content-Type": "application/json" };
 const icons = {
   rec: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>',
   done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
@@ -443,7 +451,7 @@ const icons = {
 const TIPS = {
   download: "<strong>The file to analyze</strong>Every message gets the correct UTC time, including the ones recorded before the vehicle's clock was synchronized: once NTP or the autopilot provides the time, it is applied back to the whole run. The clock's sync history stays inside, in <code>/time/sync</code>.",
   raw: "<strong>Without the time correction</strong>The file exactly as it was written. Each message keeps the absolute time the vehicle believed at that moment, so messages from before the clock was synchronized keep that earlier, possibly wrong, time: the correction is not applied back to them. Relative timing is the same as in Download. Useful to investigate the clock itself, and faster, since nothing is reprocessed on the vehicle.",
-  live: "Still being written. Downloads include everything up to the last saved chunk (about 1 MB).",
+  live: "Still being written. Downloads include everything up to the last few seconds, which are written to the card every 5 seconds.",
   done: "Finished: the logger closed this file cleanly.",
 };
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
@@ -555,22 +563,36 @@ function setHTML(id, html) {
   el.innerHTML = html;
 }
 
-function renderLinks(links, failing) {
+// MAVLink normally never pauses for this long: heartbeats alone come every second.
+const MAVLINK_SILENT_S = 5;
+const isLogs = (k) => k === "service logs" || k === "container logs" || k === "/docker/containers/json" || k.startsWith("docker logs ");
+function renderLinks(links, failing, idle, gaps) {
   const names = { mavlink2rest: "MAVLink", kernel: "Kernel messages" };
   const tips = {
     mavlink2rest: "Every MAVLink message from every component, through mavlink2rest.",
     kernel: "The Linux kernel log, from boot.",
   };
+  const chip = (k, v) => {
+    let ok = v === "connected" && !failing[k], text = esc(v);
+    if (k === "mavlink2rest" && ok && (idle[k] ?? 0) > MAVLINK_SILENT_S) {
+      ok = false;
+      text = `connected, but nothing has arrived for ${Math.round(idle[k])} s. Is the autopilot running?`;
+    }
+    const lost = k === "mavlink2rest" && gaps ? ` ${fmt.format(gaps)} messages were numbered by the autopilot but never arrived.` : "";
+    return `<span class="chip" data-tip="${esc(tips[k] || k)} <b>${text}</b>.${lost}">
+      <span class="dot ${ok ? "ok" : "warn"}"></span>${esc(names[k] || k)}</span>`;
+  };
+  const keys = Object.keys(failing);
+  const polls = keys.some((k) => k.startsWith("/") && !isLogs(k)), logs = keys.some(isLogs);
   setHTML("links", Object.entries({ mavlink2rest: "connecting", kernel: "connecting", ...links })
-    .map(([k, v]) => `<span class="chip" data-tip="${esc(tips[k] || k)} <b>${esc(v)}</b>.">
-      <span class="dot ${v === "connected" ? "ok" : "warn"}"></span>${esc(names[k] || k)}</span>`).join("")
+    .map(([k, v]) => chip(k, v)).join("")
     + `<span class="chip" data-tip="BlueOS service APIs, polled. Small, recurring data like CPU and temperature is written every time; large structures like the bag of holding only when they change.">
-      <span class="dot ${Object.keys(failing).length ? "warn" : "ok"}"></span>BlueOS services</span>`
-    + `<span class="chip" data-tip="Logs of every BlueOS service and of every container, extensions included."><span class="dot ok"></span>Logs</span>`);
+      <span class="dot ${polls ? "warn" : "ok"}"></span>BlueOS services</span>`
+    + `<span class="chip" data-tip="Logs of every BlueOS service and of every container, extensions included.${logs ? " <b>Some are failing, see below.</b>" : ""}"><span class="dot ${logs ? "warn" : "ok"}"></span>Logs</span>`);
   const f = Object.entries(failing);
   setHTML("failing", f.length
     ? `<ul class="failing">${f.map(([k, v]) => `<li><span class="dot bad"></span><code>${esc(k)}</code><span class="err">${esc(v)}</span></li>`).join("")}</ul>`
-    : `<div class="all-good">${icons.check.replace("<svg", '<svg width="16" height="16"')}Every endpoint is answering</div>`);
+    : `<div class="all-good">${icons.check.replace("<svg", '<svg width="16" height="16"')}Nothing is failing</div>`);
 }
 
 const armed = new Set();
@@ -672,7 +694,14 @@ $("recs").addEventListener("click", async (e) => {
   }
   armed.delete(name);
   hideTip();
-  await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST" });
+  const response = await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST", headers: JSON_POST })
+    .catch(() => ({ ok: false, text: async () => "The logger is not answering" }));
+  if (!response.ok) {
+    btn.classList.replace("ghost", "confirm");
+    btn.innerHTML = `${icons.trash}Failed`;
+    btn.dataset.tip = esc(await response.text());
+    setTimeout(() => { if (btn.isConnected) { btn.classList.replace("confirm", "ghost"); btn.innerHTML = icons.trash; } }, 4000);
+  }
   refresh();
 });
 
@@ -682,14 +711,15 @@ $("new-file").addEventListener("click", async (e) => {
   btn.classList.add("busy");
   hideTip();
   try {
-    const response = await fetch("new_file", { method: "POST" });
-    if (!response.ok) throw new Error(response.statusText);
+    const response = await fetch("new_file", { method: "POST", headers: JSON_POST });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
     btn.classList.replace("busy", "done");
     label.textContent = "Started";
     await refresh();
-  } catch {
+  } catch (error) {
     btn.classList.remove("busy");
     label.textContent = "Failed, try again";
+    btn.dataset.tip = `<strong>Could not start a new file</strong>${esc(error.message)}`;
   }
   setTimeout(() => { btn.classList.remove("busy", "done"); label.textContent = "New file"; }, 2000);
 });
@@ -762,7 +792,9 @@ function updatePolls() {
 }
 
 async function loadPolls() {
-  pollSettings = await (await fetch("settings", { cache: "no-store" })).json();
+  const response = await fetch("settings", { cache: "no-store", signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(response.statusText);
+  pollSettings = await response.json();
   for (const key of Object.keys(edits)) delete edits[key];
   renderPolls();
 }
@@ -780,7 +812,7 @@ $("polls").addEventListener("click", (e) => {
   hideTip();
   updatePolls();
 });
-$("polls-discard").addEventListener("click", () => { hideTip(); loadPolls(); });
+$("polls-discard").addEventListener("click", () => { hideTip(); loadPolls().catch(() => {}); });
 $("polls-apply").addEventListener("click", async () => {
   const btn = $("polls-apply"), changed = {};
   for (const poll of pollSettings.polls) {
@@ -789,30 +821,36 @@ $("polls-apply").addEventListener("click", async () => {
   }
   btn.disabled = true;
   hideTip();
-  const response = await fetch("settings", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ poll_periods: changed }),
-  });
-  const result = await response.json().catch(() => ({ error: response.statusText }));
+  const response = await fetch("settings", { method: "POST", headers: JSON_POST, body: JSON.stringify({ poll_periods: changed }) })
+    .catch(() => null);
+  const result = response ? await response.json().catch(() => ({ error: response.statusText })) : { error: "The logger is not answering. Try again." };
   if (result.error) {
     $("polls-changes").textContent = result.error;
     btn.disabled = false;
     return;
   }
-  await loadPolls();
+  await loadPolls().catch(() => {});
   btn.classList.add("done");
   btn.textContent = "Applied, new file started";
   $("polls-changes").textContent = `Recording to ${result.file}`;
   refresh();
   setTimeout(() => { btn.classList.remove("done"); btn.textContent = "Apply"; updatePolls(); }, 2500);
 });
-loadPolls();
+loadPolls().catch(() => {});  // retried by refresh() until it works
 
 const sizes = [];
-let last = null;
+let last = null, refreshing = false;
 async function refresh() {
+  if (refreshing) return;  // a slow answer must not pile up requests behind it
+  refreshing = true;
+  try { await update(); } finally { refreshing = false; }
+}
+async function update() {
   let s;
   try {
-    const response = await fetch("status", { cache: "no-store" });
+    // Short, so a lost link shows as OFFLINE within seconds instead of a stale REC.
+    const response = await fetch("status", { cache: "no-store", signal: AbortSignal.timeout(3000) });
+    if (!response.ok) throw new Error(response.statusText);
     s = await response.json();
   } catch {
     $("banner").classList.add("show");
@@ -821,14 +859,21 @@ async function refresh() {
     return;
   }
   $("banner").classList.remove("show");
+  if (!pollSettings) loadPolls().catch(() => {});
   const now = performance.now();
 
   const state = $("state");
-  state.className = `state${s.paused ? " paused" : ""}`;
-  $("state-text").textContent = s.paused ? "PAUSED" : "REC";
-  state.dataset.tip = s.paused
+  state.className = `state${s.write_error ? " error" : s.paused ? " paused" : ""}`;
+  $("state-text").textContent = s.write_error ? "NOT RECORDING" : s.paused ? "PAUSED" : "REC";
+  state.dataset.tip = s.write_error
+    ? `<strong>Not recording</strong>Writing to the card failed: ${esc(s.write_error)}. A new file is tried every 10 seconds.`
+    : s.paused
     ? "<strong>Paused</strong>The disk is almost full. Recording resumes on its own once there is space again."
     : "<strong>Recording</strong>Everything is being written to the current file.";
+  $("write-error").classList.toggle("show", !!s.write_error);
+  $("write-error-text").textContent = s.write_error
+    ? `Nothing is being recorded: writing to the card failed (${s.write_error}). The card may be failing. A new file is tried every 10 seconds.`
+    : "";
   $("version").textContent = s.version ? `Version ${s.version}` : "";
 
   if (last && s.file !== last.file) history.length = 0;
@@ -844,10 +889,10 @@ async function refresh() {
   $("messages").parentElement.dataset.tip = `${fmt.format(s.messages)} messages written to the current file since it started.`;
   tween("topics", s.topics, (v) => String(Math.round(v)));  // up to 4 digits, no separator to fit its tile
   tween("dropped", s.dropped, short);
-  $("dropped").parentElement.dataset.tip = `${fmt.format(s.dropped)} messages dropped because the disk was too full. Recording resumes on its own.`;
+  $("dropped").parentElement.dataset.tip = `${fmt.format(s.dropped)} messages not recorded, while the disk was too full or writing to the card failed. Recording resumes on its own.`;
   $("file").textContent = s.file;
 
-  // File growth over the last 30 s: the file grows in ~1 MB chunks, so a shorter window jumps around.
+  // File growth over the last 30 s: the file grows in chunks every few seconds, so a shorter window jumps around.
   const active = (s.recordings || []).find((r) => r.active);
   if (active) {
     if (sizes.length && sizes[0].file !== active.name) sizes.length = 0;
@@ -889,10 +934,10 @@ async function refresh() {
   setText("syncs", fmt.format(t.syncs));
   setText("ntp", t.linux_ntp_synced ? "Synchronized" : "Not synchronized");
 
-  renderLinks(s.links, s.failing_endpoints);
+  renderLinks(s.links, s.failing_endpoints, s.idle_s || {}, s.mavlink_gaps || 0);
   renderRecordings(s.recordings || []);
   const liveTag = document.querySelector(".rec-item.active .tag.live");
-  if (liveTag) liveTag.textContent = s.paused ? "Paused" : "Recording";
+  if (liveTag) liveTag.textContent = s.write_error ? "Not recording" : s.paused ? "Paused" : "Recording";
 }
 refresh();
 setInterval(refresh, 1000);

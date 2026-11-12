@@ -15,6 +15,7 @@ it re-stamps every message with the best reference of the whole run, which also 
 import asyncio
 import ctypes
 import errno
+import io
 import json
 import os
 import re
@@ -22,17 +23,26 @@ import shutil
 import signal
 import time
 import urllib.request
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import BoundedSemaphore, RLock, Thread
 from urllib.parse import unquote, urlparse
 
-import websockets
-from mcap.reader import make_reader
-from mcap.records import Channel, Message, Metadata
-from mcap.stream_reader import StreamReader
-from mcap.writer import Writer
+# Every source is on localhost, so retry often: the library's default backoff grows to 90 s, which after a BlueOS core
+# restart would leave MAVLink unrecorded for up to a minute after it is back.
+for _name, _value in (("INITIAL", "1"), ("MIN", "1"), ("MAX", "2")):
+    os.environ.setdefault(f"WEBSOCKETS_BACKOFF_{_name}_DELAY", _value)
+
+import websockets  # noqa: E402
+from mcap.exceptions import EndOfFile  # noqa: E402
+from mcap.reader import make_reader  # noqa: E402
+from mcap.records import Channel, Message, Metadata  # noqa: E402
+from mcap.stream_reader import StreamReader  # noqa: E402
+from mcap.writer import IndexType, Writer  # noqa: E402
 
 VERSION = os.environ.get("VERSION", "0.0.0")
 HOST = os.environ.get("BLUEOS_HOST", "127.0.0.1")
@@ -42,9 +52,19 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
 SERVICE_LOGS = Path(os.environ.get("SERVICE_LOGS", "/var/logs/blueos/services"))
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_MB", "1024")) * 2**20
 MAX_DISK_USE = float(os.environ.get("MAX_DISK_USE_PERCENT", "95")) / 100  # stop before the system runs out of space
+# What a power cut can lose: the chunk in memory is written and synced to the card at least this often.
+FLUSH_S = 5
+# MCAP channel ids are 16 bits. A client inventing topics (an id in the name) must never get near that: past this, new
+# topics go to /logger/overflow, still recorded, instead of breaking the file.
+MAX_CHANNELS = 10_000
+# Per-message indexes cost ~12 KB of memory per chunk until the file closes, which over days of uptime is too much for
+# a Pi. Readers find messages through the chunk index just the same.
+INDEXES = IndexType.ALL & ~IndexType.MESSAGE
 
-# SYSTEM_TIME arrives over a websocket, so its shift estimate jitters by the delivery latency.
-AUTOPILOT_STEP_NS = 1_000_000_000
+# SYSTEM_TIME arrives over a websocket, so each sample is late by its delivery delay. The shift is the least delayed
+# sample of the last minute, re-recorded when it moves more than this.
+AUTOPILOT_RESYNC_NS = 20_000_000
+AUTOPILOT_STEP_NS = 1_000_000_000  # a forward jump this big is the autopilot's clock being set, not a faster delivery
 # Same idea as ArduPilot's oldest_acceptable_date: anything earlier is an unset clock.
 OLDEST_VALID_NS = 1_704_067_200 * 10**9  # 2024-01-01
 
@@ -120,13 +140,20 @@ def apply_periods(new) -> str | None:
             return f"unknown poll {path!r}"
         if not valid_period(value):
             return f"the period of {path} must be a number of seconds from {MIN_PERIOD} to {MAX_PERIOD}"
-    periods.update(new)
-    changed = {path: v for path, v in periods.items() if v != DEFAULT_PERIODS[path]}
+    merged = {**periods, **new}
+    changed = {path: v for path, v in merged.items() if v != DEFAULT_PERIODS[path]}
     temporary = SETTINGS.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"poll_periods": changed}, indent=2))
-    temporary.replace(SETTINGS)  # a power cut leaves the old settings or the new ones, never half
+    try:
+        temporary.write_text(json.dumps({"poll_periods": changed}, indent=2))
+        temporary.replace(SETTINGS)  # a power cut leaves the old settings or the new ones, never half
+    except OSError as error:  # nothing changes, so the current file's poll_periods_s stays true
+        return f"could not save the settings: {error}"
+    periods.update(new)
     rec.event(f"poll periods changed: {json.dumps(changed)}")
-    rec.rotate()
+    try:
+        rec.rotate()
+    except Exception as error:
+        return f"saved, but could not start a new file: {error}"
     return None
 
 # Logs end up shared with other people, so never write anything that looks like a credential.
@@ -186,56 +213,117 @@ class Clock:
 
 
 class Recorder:
+    """The one place that writes to the file. It never raises: a failure is shown on the page and recorded, and
+    recording goes on as soon as the disk lets it."""
+
     def __init__(self, clock: Clock):
         self.clock = clock
-        self.generation = 0  # bumped with every new file, so sources that write on change write their state again
-        self._open()
-        self.dropped = 0
+        self.generation = 0  # bumped with every new file and resume, so sources that write on change write again
+        # Reentrant, because start() writes. The container log threads write directly, so a backlog can't starve the
+        # event loop, and every writer call happens under it.
+        self.lock = RLock()
+        self.dropped = 0  # messages not recorded: while paused for disk space or after a write error
         self.paused = False
-        self.errors: dict[str, str] = {}
+        self.closed = False  # finished for good: the logger is stopping
+        self.write_error: str | None = None  # the writer failed: nothing is recorded until a new file opens
+        self.errors: dict[str, str] = {}  # what is failing, shown on the page
         self.links: dict[str, str] = {}
-        self.lock = Lock()  # the container log threads write directly, so a backlog can't starve the event loop
+        self.seen: dict[str, float] = {}  # monotonic time of the last message from each websocket
+        try:
+            self.path, self.file, self.writer = self._new_file()
+        except Exception as error:  # a read-only card, say: the page says so, and watch_disk keeps trying
+            self.path, self.file, self.writer = LOG_DIR / "none", None, None
+            self._failed(error)
+        self._reset()
 
-    def _open(self) -> None:
+    def _new_file(self):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         # The sequence number keeps files in recording order even when the clock that named them was wrong.
         number = max((int(p.name[:4]) for p in LOG_DIR.glob("[0-9][0-9][0-9][0-9]_*.mcap")), default=0) + 1
         stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
-        self.path = LOG_DIR / f"{number:04d}_{stamp}.mcap"
-        self.file = open(self.path, "xb")  # never overwrite a recording
-        # ponytail: data since the last 1 MB chunk is lost on power cut; `mcap recover` salvages the rest.
-        self.writer = Writer(self.file)
-        self.writer.start(library=f"blueos-complete-data-logger/{VERSION}")
+        path = LOG_DIR / f"{number:04d}_{stamp}.mcap"
+        file = open(path, "xb")  # never overwrite a recording
+        try:
+            writer = Writer(file, index_types=INDEXES)
+            writer.start(library=f"blueos-complete-data-logger/{VERSION}")
+            file.flush()  # the header on the card right away, so the new file reads as MCAP from its first second
+        except BaseException:
+            file.close()
+            raise
+        return path, file, writer
+
+    def _reset(self) -> None:
         self.channels: dict[str, int] = {}
         self.messages = 0
+        # MCAP readers sort by log_time, so within a file it must never jump: mono_ns placed at the best UTC estimate
+        # of the moment the file started.
+        self.start_shift = self.clock.shift
+        self.flushed = time.monotonic()
         self.generation += 1
 
     def start(self) -> None:
         """Opens the file with what a reader needs to place it in time on its own."""
-        boot_id = Path("/proc/sys/kernel/random/boot_id")
-        self.writer.add_metadata("recording", {
-            "extension_version": VERSION,
-            "boot_id": boot_id.read_text().strip() if boot_id.exists() else "unknown",
-            "start_mono_ns": str(time.monotonic_ns()),
-            "start_wall_ns": str(time.time_ns()),
-        })
-        self.writer.add_metadata("poll_periods_s", {path: str(period) for path, period in periods.items()})
-        # The reference in use, so a file started after the sync is synchronized from its first message.
+        with self.lock:
+            self._metadata("recording", {
+                "extension_version": VERSION,
+                "boot_id": boot_id() or "unknown",
+                "start_mono_ns": str(time.monotonic_ns()),
+                "start_wall_ns": str(time.time_ns()),
+            })
+            self._metadata("poll_periods_s", {path: str(period) for path, period in periods.items()})
+            # The reference in use, so a file started after the sync is synchronized from its first message.
+            self.write_reference(file_start=True)
+
+    def write_reference(self, **extra) -> None:
         self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": self.clock.shift, "step_ns": 0,
                                   "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": ntp_synced(),
-                                  "file_start": True})
+                                  **extra})
 
     def rotate(self) -> Path:
         """Closes the current file and starts the next one, without losing or misplacing a message. Returns the
-        finished file."""
-        finished = self.path
-        self.event("closing this file, recording continues in the next one")
+        finished file. Raises, and keeps recording into the current file, if the next one can't be created."""
         with self.lock:
+            if self.write_error:
+                raise RuntimeError(f"recording is stopped by a write error: {self.write_error}")
+            new = self._new_file()  # first, so a failure leaves the current file recording
+            finished = self.path
+            self.event("closing this file, recording continues in the next one")
             self._close()
-            self._open()
-        self.start()
-        self.event(f"started after {finished.name}")
+            self.path, self.file, self.writer = new
+            self._reset()
+            self.start()
+            self.event(f"started after {finished.name}")
         return finished
+
+    def recover(self) -> bool:
+        """After a write error, tries a new file. Returns whether recording goes on."""
+        with self.lock:
+            if not self.write_error:
+                return True
+            try:
+                new = self._new_file()
+            except Exception as error:
+                self.errors["recording"] = f"stopped by {self.write_error}; a new file can't be created either: " \
+                                           f"{type(error).__name__}: {error}"
+                return False
+            failure, lost = self.write_error, self.dropped - self.dropped_at_failure
+            self.write_error = None
+            self.errors.pop("recording", None)
+            self.path, self.file, self.writer = new
+            self._reset()
+            self.start()
+            self.event(f"recording resumed in a new file after a write error ({failure}). Not recorded: {lost} "
+                       f"messages, plus the last {FLUSH_S} s before the error")
+        return True
+
+    def resume(self) -> None:
+        """Recording again after a pause for disk space: what is only written on change is written again, so the file
+        never shows a state from before the pause as current."""
+        with self.lock:
+            self.paused = False
+            self.generation += 1
+            self.event(f"recording resumed after dropping {self.dropped} messages")
+            self.write_reference(resumed=True)
 
     def write(self, topic: str, data, mono: int | None = None) -> None:
         with self.lock:
@@ -243,7 +331,7 @@ class Recorder:
 
     def _write(self, topic: str, data, mono: int | None) -> None:
         """Records `data` as happening now, or at `mono` (our CLOCK_MONOTONIC) when the sender stamped it."""
-        if self.paused:
+        if self.paused or self.closed or self.write_error:
             self.dropped += 1
             return
         now, wall = time.monotonic_ns(), time.time_ns()
@@ -253,16 +341,58 @@ class Recorder:
         else:
             wall -= now - mono  # what Linux believed when it happened
             extra["received_mono_ns"] = now
-        if topic not in self.channels:
-            self.channels[topic] = self.writer.register_channel(topic, message_encoding="json", schema_id=0)
+        if topic not in self.channels and len(self.channels) >= MAX_CHANNELS:
+            self.errors["topics"] = f"over {MAX_CHANNELS} topics in this file: new ones go to /logger/overflow"
+            data, topic = {"topic": topic, "data": data}, "/logger/overflow"
         envelope = {"mono_ns": mono, "wall_ns": wall, "corrected_ns": mono + self.clock.shift,
                     "time_synced_externally": self.clock.synced, "time_source": self.clock.source, **extra,
                     "data": data}
-        payload = json.dumps(envelope, separators=(",", ":")).encode()
-        # MCAP readers sort by log_time, so it must never jump: monotonic time placed at the wall time of the start.
-        log_time = mono + self.clock.start_shift
-        self.writer.add_message(self.channels[topic], log_time=log_time, data=payload, publish_time=wall)
+        try:
+            payload = json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()
+        except ValueError:  # NaN or Infinity: no JSON reader accepts them, so they are written as null
+            envelope = json.loads(json.dumps(envelope), parse_constant=lambda _: None)
+            payload = json.dumps(envelope, separators=(",", ":")).encode()
+        try:
+            if topic not in self.channels:
+                self.channels[topic] = self.writer.register_channel(topic, message_encoding="json", schema_id=0)
+            self.writer.add_message(self.channels[topic], log_time=mono + self.start_shift, data=payload,
+                                    publish_time=wall)
+        except Exception as error:
+            self._failed(error)
+            return
         self.messages += 1
+
+    def _metadata(self, name: str, data: dict) -> None:
+        if self.write_error:
+            return
+        try:
+            self.writer.add_metadata(name, data)
+        except Exception as error:
+            self._failed(error)
+
+    def _failed(self, error: Exception) -> None:
+        """The card returned an error (EIO, a read-only remount...). The writer may hold half a record, so it is never
+        used again: recording stops, visibly, until watch_disk gets a new file open."""
+        self.write_error = f"{type(error).__name__}: {error}"
+        self.errors["recording"] = f"stopped by a write error: {self.write_error}"
+        self.dropped_at_failure = self.dropped
+        print(f"recording stopped by a write error: {error!r}", flush=True)
+        with suppress(Exception):
+            self.file.close()
+
+    def flush(self) -> int | None:
+        """Writes the chunk in memory out. Returns the file descriptor to fsync, outside the lock: on a slow card
+        that can take a while, and the event loop writes under this lock."""
+        with self.lock:
+            if self.write_error or self.file.closed:
+                return None
+            try:
+                self.writer.flush()
+            except Exception as error:
+                self._failed(error)
+                return None
+            self.flushed = time.monotonic()
+            return self.file.fileno()
 
     def event(self, text: str) -> None:
         print(text, flush=True)
@@ -270,36 +400,49 @@ class Recorder:
 
     def sync(self, source: str, shift: int, **extra) -> bool:
         """Moves the reference to `source` unless a better one is already in use. Returns whether it moved."""
-        if RANK[source] < RANK[self.clock.source]:
-            return False
-        previous = self.clock.shift
-        self.clock.shift, self.clock.source = shift, source
-        self.clock.syncs += 1
-        self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": previous, "step_ns": shift - previous,
-                                  "boottime_ns": time.clock_gettime_ns(BOOTTIME), "linux_ntp_synced": ntp_synced(),
-                                  **extra})
+        with self.lock:
+            if RANK[source] < RANK[self.clock.source]:
+                return False
+            previous = self.clock.shift
+            self.clock.shift, self.clock.source = shift, source
+            self.clock.syncs += 1
+            self.write("/time/sync", {**self.clock.reference(), "previous_shift_ns": previous,
+                                      "step_ns": shift - previous, "boottime_ns": time.clock_gettime_ns(BOOTTIME),
+                                      "linux_ntp_synced": ntp_synced(), **extra})
         print(f"time reference {source}: corrected time is now {iso(time.monotonic_ns() + shift)}", flush=True)
         return True
 
     def finish(self) -> None:
-        # The reference export() applies to the whole file: corrected = mono_ns + shift_ns.
         with self.lock:
-            self.paused = True  # threads still running get dropped from here on
+            self.closed = True  # threads still running get dropped from here on
             self._close()
 
     def _close(self) -> None:
-        self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
-        self.writer.finish()
-        self.file.close()
+        """Ends the file with its index and the reference export() applies to it: corrected = mono_ns + shift_ns."""
+        try:
+            if not self.write_error:
+                self.writer.add_metadata("time", {k: str(v) for k, v in self.clock.reference().items()})
+                self.writer.finish()
+                self.file.flush()
+                os.fsync(self.file.fileno())
+        except Exception as error:  # the file stays readable up to its last chunk
+            print(f"could not finish {self.path.name}: {error!r}", flush=True)
+        finally:
+            with suppress(Exception):
+                self.file.close()
 
 
 clock = Clock()
 rec: Recorder  # created in main(), after the event loop exists
 
 
-def get_json(path: str):
+def fetch(path: str) -> bytes:
     with urllib.request.urlopen(f"http://{HOST}{path}", timeout=15) as response:
-        body = response.read()
+        return response.read()
+
+
+def get_json(path: str):
+    body = fetch(path)
     return json.loads(body) if body else None
 
 
@@ -308,53 +451,99 @@ async def poll(path: str, always: bool) -> None:
     last, generation = None, rec.generation
     while True:
         started = time.monotonic()
-        if generation != rec.generation:  # a new file: write the current state even if it didn't change
+        if generation != rec.generation:  # a new file, or a resume: write the current state even if it didn't change
             last, generation = None, rec.generation
         try:
-            data, failed = redact(await asyncio.to_thread(get_json, path)), False
+            body = await asyncio.to_thread(fetch, path)
+            # Compared as bytes, so an unchanged answer (the bag of holding is ~600 KB) costs no parsing at all.
+            if body != last or always:
+                rec.write(topic, redact(json.loads(body)) if body else None)
+            last = body
             rec.errors.pop(path, None)
         except Exception as error:  # a service being down is data too
-            data, failed = {"error": f"{type(error).__name__}: {error}"}, True
-            rec.errors[path] = data["error"]
-        encoded = json.dumps(data, sort_keys=True)
-        if encoded != last or (always and not failed):
-            rec.write(topic, data)
-        last = encoded
+            message = f"{type(error).__name__}: {error}"
+            rec.errors[path] = message
+            if message != last:
+                rec.write(topic, {"error": message})
+            last = message
         # Wait out the period, but a new file (which is also how new periods are applied) cuts the wait short.
         while time.monotonic() - started < periods[path] and generation == rec.generation:
             await asyncio.sleep(min(0.5, max(0.0, periods[path] - (time.monotonic() - started))))
 
 
-def autopilot_time(message: dict) -> None:
+autopilot_shifts: deque[int] = deque(maxlen=60)
+autopilot_system: int | None = None
+
+
+def autopilot_time(message: dict, system: int) -> None:
+    global autopilot_system
     unix_ns = message.get("time_unix_usec", 0) * 1000
     if unix_ns < OLDEST_VALID_NS:  # the autopilot has no time source yet
+        return
+    if autopilot_system is None:
+        autopilot_system = system
+    elif system != autopilot_system:  # another vehicle or a SITL on the same network: one clock only
+        if f"SYSTEM_TIME {system}" not in rec.errors:
+            rec.errors[f"SYSTEM_TIME {system}"] = f"ignored: the time reference follows system {autopilot_system}"
+            rec.event(f"SYSTEM_TIME from system {system} ignored, the time reference follows system {autopilot_system}")
         return
     # ArduPilot never moves its clock backwards, so after a bad SYSTEM_TIME from a topside it can stay wrong while NTP
     # has already fixed Linux. That's why it ranks below NTP (see RANK).
     shift = unix_ns - time.monotonic_ns()
-    if clock.source != "autopilot" or abs(shift - clock.shift) > AUTOPILOT_STEP_NS:
-        rec.sync("autopilot", shift, time_unix_usec=message["time_unix_usec"], time_boot_ms=message.get("time_boot_ms"))
+    if autopilot_shifts and shift > max(autopilot_shifts) + AUTOPILOT_STEP_NS:
+        autopilot_shifts.clear()  # the autopilot's clock was set: what came before no longer applies
+    autopilot_shifts.append(shift)
+    # Every delivery delay makes a sample's shift smaller, so the largest is the least delayed: the best estimate.
+    best = max(autopilot_shifts)
+    if clock.source != "autopilot" or abs(best - clock.shift) > AUTOPILOT_RESYNC_NS:
+        rec.sync("autopilot", best, time_unix_usec=message["time_unix_usec"], time_boot_ms=message.get("time_boot_ms"),
+                 system_id=system)
 
 
 async def websocket(name: str, path: str, handle) -> None:
     # Iterating connect() reconnects with backoff when the service restarts or nginx answers 5xx.
     async for ws in websockets.connect(f"ws://{HOST}{path}", max_size=None, open_timeout=10):
         rec.links[name] = "connected"
+        rec.seen[name] = time.monotonic()
+        rec.errors.pop(name, None)
         rec.event(f"{name} connected")
+        bad = 0
         try:
             async for raw in ws:
-                handle(json.loads(raw))
+                rec.seen[name] = time.monotonic()
+                try:
+                    handle(json.loads(raw))
+                except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                    # One unexpected message must not cost the connection: it is kept as it came.
+                    bad += 1
+                    rec.errors[name] = f"{bad} unexpected messages, kept in /logger/unparsed/{name}: {error!r}"
+                    rec.write(f"/logger/unparsed/{name}", {"error": repr(error), "raw": str(raw)[:2**16]})
         except websockets.ConnectionClosed:
             pass
-        rec.links[name] = "reconnecting"
+        finally:
+            rec.links[name] = "reconnecting"
         rec.event(f"{name} disconnected")
 
 
+mavlink_sequence: dict[int, int] = {}
+# Messages an autopilot numbered that never reached us. Only autopilots (component 1): other components, like the camera
+# manager's 100 to 102, share one counter between them or repeat it, which would read as losses that aren't.
+mavlink_gaps = 0
+
+
 def handle_mavlink(packet: dict) -> None:
+    global mavlink_gaps
     header, message = packet["header"], packet["message"]
-    rec.write(f"/mavlink/{header['system_id']}/{header['component_id']}/{message['type']}", packet)
+    sender = (header["system_id"], header["component_id"])
+    rec.write(f"/mavlink/{sender[0]}/{sender[1]}/{message['type']}", packet)
+    sequence = header.get("sequence")
+    if sender[1] == 1 and isinstance(sequence, int):
+        gap = (sequence - mavlink_sequence.get(sender[0], sequence - 1) - 1) % 256
+        if gap < 128:  # a bigger jump is a reordering or a restarted sender, not a loss
+            mavlink_gaps += gap
+        mavlink_sequence[sender[0]] = sequence
     if message["type"] == "SYSTEM_TIME" and header["component_id"] == 1:
-        autopilot_time(message)
+        autopilot_time(message, header["system_id"])
 
 
 last_kernel_sequence = -1
@@ -432,11 +621,13 @@ def read_new_lines(path: Path, state: list) -> None:
     position = offset - len(partial)
     lines = (partial + chunk).split(b"\n")
     state[:] = [offset + len(chunk), lines.pop(), backfill_until]
-    for line in lines:
+    for number, line in enumerate(lines):
         if line.strip():
             rec.write(f"/blueos/logs/{path.parent.name}",
                       {"line": line.decode(errors="replace"), "file": path.name, "backfill": position < backfill_until})
         position += len(line) + 1
+        if number % 200 == 199:
+            yield_to_event_loop()
 
 
 COMPRESSED = {".gz", ".zip", ".xz", ".bz2", ".zst", ".lz4"}
@@ -446,34 +637,42 @@ async def tail_service_logs() -> None:
     # Every file is followed, not just the newest: log files are named and dated by the wall clock, so after a
     # backward step the file being written can look older than the one before it.
     boot_wall = time.time() - time.clock_gettime(BOOTTIME)
-    tails: dict[Path, list] = {}  # file -> [offset, partial line]
+    tails: dict[Path, list] = {}  # file -> read_new_lines state
     first_scan = True
 
     def scan() -> None:  # in a thread: the backlog since boot can be hundreds of MB, too much for the event loop
-        if SERVICE_LOGS.is_dir():
-            seen = set()
-            for path in SERVICE_LOGS.glob("*/*"):
-                try:
-                    # Rotated logs get compressed; their lines were already read as text, or are from before.
-                    if path.suffix in COMPRESSED or not path.is_file():
-                        continue
-                    seen.add(path)
-                    if path not in tails:
-                        # At start, read whole only what was written since boot, so the boot sequence is in the log.
-                        # Files that show up later are new rotations, read whole.
-                        size = path.stat().st_size
-                        whole = not first_scan or path.stat().st_mtime > boot_wall
-                        tails[path] = [0 if whole else size, b"", size if first_scan else 0]
-                    read_new_lines(path, tails[path])
-                except OSError:  # zipped away mid-scan
+        if not SERVICE_LOGS.is_dir():
+            rec.errors["service logs"] = f"{SERVICE_LOGS} is not there: BlueOS service logs are not recorded"
+            return
+        rec.errors.pop("service logs", None)
+        seen = set()
+        for path in SERVICE_LOGS.glob("*/*"):
+            try:
+                # Rotated logs get compressed; their lines were already read as text, or are from before.
+                if path.suffix in COMPRESSED or not path.is_file():
                     continue
-            for gone in tails.keys() - seen:
-                del tails[gone]
+                seen.add(path)
+                if path not in tails:
+                    # At start, read whole only what was written since boot, so the boot sequence is in the log.
+                    # Files that show up later are new rotations, read whole.
+                    size = path.stat().st_size
+                    whole = not first_scan or path.stat().st_mtime > boot_wall
+                    tails[path] = [0 if whole else size, b"", size if first_scan else 0]
+                read_new_lines(path, tails[path])
+            except OSError:  # zipped away mid-scan
+                continue
+        for gone in tails.keys() - seen:
+            del tails[gone]
 
     while True:
         await asyncio.to_thread(scan)
         first_scan = False
         await asyncio.sleep(1)
+
+
+def yield_to_event_loop() -> None:
+    """For threads writing a backlog: a moment without the GIL or the recorder's lock, so MAVLink isn't held up."""
+    time.sleep(0.001)
 
 
 def parse_docker_line(line: str) -> tuple[str, int | None]:
@@ -488,13 +687,23 @@ def parse_docker_line(line: str) -> tuple[str, int | None]:
 
 
 def follow_container(container: dict, since_ns: int, backfill_until_ns: int, last_seen: dict) -> None:
-    """Runs in its own thread until the container stops: a log stream can stay silent for hours."""
+    """Runs in its own thread until the container stops: a log stream can stay silent for hours. A failure shows on
+    the page, and follow_container_logs starts it again."""
     name = container["Names"][0].lstrip("/")
+    try:
+        stream_container(container, name, since_ns, backfill_until_ns, last_seen)
+    except Exception as error:
+        rec.errors[f"docker logs {name}"] = f"{type(error).__name__}: {error}"
+
+
+def stream_container(container: dict, name: str, since_ns: int, backfill_until_ns: int, last_seen: dict) -> None:
     base = f"http://{HOST}/docker/containers/{container['Id']}"
     tty = get_json(f"/docker/containers/{container['Id']}/json")["Config"]["Tty"]
     since = f"{since_ns // 10**9}.{since_ns % 10**9:09d}"
     url = f"{base}/logs?follow=1&stdout=1&stderr=1&timestamps=1&since={since}"
     with urllib.request.urlopen(url, timeout=None) as response:
+        rec.errors.pop(f"docker logs {name}", None)
+        lines = 0
         while True:
             if tty:  # one raw stream
                 stream, payload = "stdout", response.readline()
@@ -507,6 +716,9 @@ def follow_container(container: dict, since_ns: int, backfill_until_ns: int, las
             if not payload:
                 return
             for line in payload.decode(errors="replace").splitlines():
+                lines += 1
+                if lines % 200 == 0:
+                    yield_to_event_loop()
                 text, docker_ns = parse_docker_line(line)
                 if docker_ns:
                     last_seen[name] = docker_ns
@@ -526,6 +738,7 @@ async def follow_container_logs() -> None:
     while True:
         try:
             containers = await asyncio.to_thread(get_json, "/docker/containers/json")
+            rec.errors.pop("/docker/containers/json", None)
         except Exception as error:
             rec.errors["/docker/containers/json"] = f"{type(error).__name__}: {error}"
             containers = []
@@ -554,34 +767,81 @@ class _Counting:
         return self.position
 
 
-def records(path: Path):
-    """Every record of a recording, including one still being written or cut short by a power loss."""
+def chunk_records(data: bytes) -> list:
+    """The records of one chunk, read on its own. Raises if it is damaged (its CRC is checked)."""
+    found = []
+    with suppress(EndOfFile):  # the end of the chunk
+        for record in StreamReader(io.BytesIO(data), skip_magic=True, validate_crcs=True).records:
+            found.append(record)
+    return found
+
+
+def records(path: Path, problems: list):
+    """Every record of a recording, including one still being written or cut short by a power loss. What could not
+    be read is added to `problems`."""
     with path.open("rb") as file:
         try:
-            yield from StreamReader(file).records
-        except Exception:  # the unfinished end of the file
+            reader = make_reader(file)
+            summary = reader.get_summary()
+            metadata = list(reader.iter_metadata())
+        except Exception:  # unfinished: no index
+            summary = None
+        if summary is not None and summary.chunk_indexes:
+            # A finished file is read chunk by chunk, so a damaged chunk costs only its own messages.
+            yield from summary.channels.values()
+            yield from metadata
+            for index in summary.chunk_indexes:
+                file.seek(index.chunk_start_offset)
+                try:
+                    found = chunk_records(file.read(index.chunk_length))
+                except Exception as error:
+                    problems.append(f"damaged chunk at byte {index.chunk_start_offset}, skipped: {error!r}")
+                    continue
+                yield from found
             return
+        file.seek(0)
+        try:
+            yield from StreamReader(file).records
+        except Exception as error:  # the unfinished end of the file, or damage
+            problems.append(f"read up to byte {file.tell()} of {path.stat().st_size}: {error!r}")
 
 
-def final_reference(path: Path) -> dict:
+def file_metadata(path: Path) -> dict:
+    """The metadata records of a recording, finished or not."""
+    try:
+        with path.open("rb") as file:
+            return {m.name: m.metadata for m in make_reader(file).iter_metadata()}
+    except Exception:
+        return {r.name: r.metadata for r in records(path, []) if isinstance(r, Metadata)}
+
+
+def boot_id() -> str | None:
+    with suppress(OSError):
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return None
+
+
+def final_reference(path: Path) -> dict | None:
     if path == rec.path:
         return clock.reference()
-    try:  # a finished file has it in its summary
-        with path.open("rb") as file:
-            for metadata in make_reader(file).iter_metadata():
-                if metadata.name == "time":
-                    m = metadata.metadata
-                    return {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
-    except Exception:
-        pass
-    # An unfinished file: the reference only ever improves, so the last /time/sync record is the best one.
-    channels, best = {}, None
-    for record in records(path):
-        if isinstance(record, Channel):
-            channels[record.id] = record.topic
-        elif isinstance(record, Message) and channels.get(record.channel_id) == "/time/sync":
-            data = json.loads(record.data)["data"]
-            best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
+    metadata = file_metadata(path)
+    best = None
+    if "time" in metadata:  # a finished file has the reference it reached in its summary
+        m = metadata["time"]
+        best = {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
+    else:  # an unfinished file: the reference only ever improves, so the last /time/sync record is the best one
+        channels = {}
+        for record in records(path, []):
+            if isinstance(record, Channel):
+                channels[record.id] = record.topic
+            elif isinstance(record, Message) and channels.get(record.channel_id) == "/time/sync":
+                data = json.loads(record.data)["data"]
+                best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
+    # mono_ns is the same clock for the whole boot, so a better reference reached since that file closed fixes it too.
+    current_boot = boot_id()
+    same_boot = current_boot is not None and metadata.get("recording", {}).get("boot_id") == current_boot
+    if same_boot and (best is None or RANK[clock.source] > RANK[best["source"]]):
+        return clock.reference()
     return best
 
 
@@ -589,34 +849,55 @@ def export(path: Path, out) -> None:
     """Writes `path` re-stamped with the best time reference of the whole run, which mono_ns makes possible:
     it never jumps within a boot, so one shift is right for every message, before and after the sync."""
     reference = final_reference(path)
-    writer = Writer(_Counting(out))
+    writer = Writer(_Counting(out), index_types=INDEXES)
     writer.start(library=f"blueos-complete-data-logger/{VERSION}")
     channels: dict[int, int] = {}
-    for record in records(path):
+    problems: list[str] = []
+    skipped = 0
+    for record in records(path, problems):
         if isinstance(record, Channel):
-            channels[record.id] = writer.register_channel(record.topic, message_encoding="json", schema_id=0)
+            if record.id not in channels:  # chunks repeat their channels
+                channels[record.id] = writer.register_channel(record.topic, message_encoding="json", schema_id=0)
         elif isinstance(record, Metadata) and record.name != "time":
             writer.add_metadata(record.name, record.metadata)
-        elif isinstance(record, Message) and reference:
-            envelope = json.loads(record.data)
-            envelope["corrected_ns"] = envelope["mono_ns"] + reference["shift_ns"]
-            envelope["time_synced_externally"] = reference["synced"]
-            envelope["time_source"] = reference["source"]
-            writer.add_message(channels[record.channel_id], log_time=envelope["corrected_ns"],
-                               data=json.dumps(envelope, separators=(",", ":")).encode(),
-                               publish_time=record.publish_time)
+        elif isinstance(record, Message):
+            try:
+                envelope = json.loads(record.data)
+                log_time = record.log_time
+                if reference:
+                    envelope["corrected_ns"] = log_time = envelope["mono_ns"] + reference["shift_ns"]
+                    envelope["time_synced_externally"] = reference["synced"]
+                    envelope["time_source"] = reference["source"]
+                writer.add_message(channels[record.channel_id], log_time=log_time,
+                                   data=json.dumps(envelope, separators=(",", ":")).encode(),
+                                   publish_time=record.publish_time)
+            except (ValueError, KeyError, TypeError):
+                skipped += 1
     writer.add_metadata("time", {k: str(v) for k, v in (reference or {}).items()})
+    if problems or skipped:  # said in the file itself, so a partial download never passes for a whole one
+        writer.add_metadata("export_problems", {"skipped_messages": str(skipped),
+                                                **{f"problem_{i}": p for i, p in enumerate(problems)}})
     writer.finish()
 
 
 TOPIC_PART = re.compile(r"[^A-Za-z0-9_.-]+")
 MAX_FUTURE_NS = 1_000_000_000  # a sender's sync can be off by about its round trip, never by a second
+MAX_PAST_NS = 600 * 10**9  # a sender may buffer, but not for longer than this
 
 
 def time_info() -> dict:
     mono = time.monotonic_ns()
     return {"mono_ns": mono, "corrected_ns": mono + clock.shift, "shift_ns": clock.shift,
             "time_synced_externally": clock.synced, "time_source": clock.source}
+
+
+def refuse(state: dict, error: str) -> dict:
+    """A refused log is data that never reaches the file, so the operator sees it on the page, not only the client."""
+    state["refused"] = state.get("refused", 0) + 1
+    rec.errors[f"ingest {state['name']}"] = f"{state['refused']} messages refused: {error}"
+    if state["refused"] == 1:
+        rec.event(f"client {state['name']}: refusing messages: {error}")
+    return {"op": "error", "error": error}
 
 
 def ingest(state: dict, message) -> dict | None:
@@ -634,11 +915,17 @@ def ingest(state: dict, message) -> dict | None:
         topic, mono = message.get("topic"), message.get("mono_ns")
         parts = [TOPIC_PART.sub("_", part) for part in topic.split("/") if part.strip(".")] if isinstance(topic, str) else []
         if not parts:
-            return {"op": "error", "error": "log needs a topic"}
-        if mono is not None and (type(mono) is not int or not 0 < mono <= time.monotonic_ns() + MAX_FUTURE_NS):
-            return {"op": "error", "error": "mono_ns must be our CLOCK_MONOTONIC in ns, from a sync, not in the future"}
+            return refuse(state, "log needs a topic")
+        now = time.monotonic_ns()
+        if mono is not None and (type(mono) is not int or not now - MAX_PAST_NS <= mono <= now + MAX_FUTURE_NS):
+            return refuse(state, "mono_ns must be our CLOCK_MONOTONIC in ns, from a sync, not in the future and "
+                                 "not over 10 minutes old")
+        if rec.paused or rec.write_error:
+            return refuse(state, "recording is paused: " + (rec.write_error or "disk full"))
         # Always under the sender's own namespace, so nobody can write into /time or /mavlink.
         rec.write(f"/extensions/{state['name']}/{'/'.join(parts)[:200]}", message.get("data"), mono=mono)
+        if state.pop("refused", None):
+            rec.errors.pop(f"ingest {state['name']}", None)
         return None
     return {"op": "error", "error": f"unknown op {op!r}, expected hello, sync or log"}
 
@@ -650,14 +937,16 @@ async def serve_ingest() -> None:
             async for raw in ws:
                 try:
                     reply = ingest(state, json.loads(raw))
-                except ValueError:
+                except (ValueError, RecursionError):  # RecursionError: nested deeper than the parser goes
                     reply = {"op": "error", "error": "invalid JSON"}
                 if reply:
                     await ws.send(json.dumps(reply))
         finally:
+            rec.errors.pop(f"ingest {state['name']}", None)
             rec.event(f"client {state['name']} disconnected")
 
-    async with websockets.serve(client, "0.0.0.0", INGEST_PORT, max_size=2**20):
+    # A short close_timeout, so a frozen client can't hold up a shutdown.
+    async with websockets.serve(client, "0.0.0.0", INGEST_PORT, max_size=2**20, max_queue=16, close_timeout=1):
         await asyncio.Future()
 
 
@@ -666,18 +955,32 @@ def disk_full(usage) -> bool:
 
 
 async def watch_disk() -> None:
+    """Pauses before the disk fills, resumes when there is room, and gets recording going again after a write error."""
     while True:
-        paused = disk_full(shutil.disk_usage(LOG_DIR))
+        paused = disk_full(await asyncio.to_thread(shutil.disk_usage, LOG_DIR))
         if paused and not rec.paused:
             rec.event(f"recording paused: disk over {MAX_DISK_USE:.0%} full or under {MIN_FREE_BYTES // 2**20} MB free")
             rec.paused = True
-        elif rec.paused and not paused:
-            rec.paused = False
-            rec.event(f"recording resumed after dropping {rec.dropped} messages")
+        elif rec.paused and not paused and not rec.closed:
+            rec.resume()
+        if rec.write_error:
+            rec.recover()
         await asyncio.sleep(10)
 
 
+async def keep_flushed() -> None:
+    """Bounds what a power cut can lose to the last FLUSH_S seconds: the chunk in memory is written out, then synced
+    to the card, which otherwise could keep finished chunks in its cache for half a minute."""
+    while True:
+        await asyncio.sleep(FLUSH_S)
+        fd = rec.flush()
+        if fd is not None:
+            with suppress(OSError):  # the file was swapped by a new one meanwhile: it was synced as it closed
+                await asyncio.to_thread(os.fsync, fd)
+
+
 async def supervise(name: str, run) -> None:
+    clear = None
     while True:
         try:
             await run()
@@ -685,8 +988,13 @@ async def supervise(name: str, run) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # a bug in one source must not stop the others from recording
+            if clear:
+                clear.cancel()
+            rec.errors[name] = f"crashed, restarting: {type(error).__name__}: {error}"
             rec.event(f"{name} crashed, restarting: {error!r}")
             await asyncio.sleep(5)
+            # Off the page once it has run for a minute without crashing again.
+            clear = asyncio.get_running_loop().call_later(60, rec.errors.pop, name, None)
 
 
 REGISTER_SERVICE = {
@@ -700,30 +1008,50 @@ REGISTER_SERVICE = {
 }
 
 
+def recordings() -> list:
+    found = []
+    for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True):
+        with suppress(OSError):  # deleted meanwhile
+            found.append({"name": p.name, "size": p.stat().st_size, "active": p == rec.path})
+    return found
+
+
 def status() -> dict:
-    mono = time.monotonic_ns()
+    mono, now = time.monotonic_ns(), time.monotonic()
+    try:
+        usage = shutil.disk_usage(LOG_DIR)
+        disk = {"total": usage.total, "free": usage.free, "max_use": MAX_DISK_USE, "min_free": MIN_FREE_BYTES}
+    except OSError:
+        disk = None
     return {
         "file": rec.path.name,
         "messages": rec.messages,
         "topics": len(rec.channels),
         "paused": rec.paused,
+        "write_error": rec.write_error,
         "dropped": rec.dropped,
         "links": rec.links,
-        "failing_endpoints": rec.errors,
+        # Seconds since each connected websocket last sent something: connected but silent is not healthy.
+        "idle_s": {name: round(now - rec.seen[name], 1) for name, state in rec.links.items()
+                   if state == "connected" and name in rec.seen},
+        "mavlink_gaps": mavlink_gaps,
+        "failing_endpoints": dict(rec.errors),
         "time": {"source": clock.source, "synced_externally": clock.synced, "syncs": clock.syncs,
                  "corrected": iso(mono + clock.shift), "linux": iso(time.time_ns()), "linux_ntp_synced": ntp_synced()},
         "version": VERSION,
-        "disk": {"total": (disk := shutil.disk_usage(LOG_DIR)).total, "free": disk.free,
-                 "max_use": MAX_DISK_USE, "min_free": MIN_FREE_BYTES},
-        "recordings": [{"name": p.name, "size": p.stat().st_size, "active": p == rec.path}
-                       for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True)],
+        "disk": disk,
+        "recordings": recordings(),
     }
 
 
 PAGE = (Path(__file__).parent / "index.html").read_bytes()
+# A corrected download re-encodes every message in this process, so one at a time keeps a core for recording.
+exporting = BoundedSemaphore(1)
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30  # a client that stops talking (a dropped tether) frees its thread instead of holding it forever
+
     def log_message(self, *args) -> None:
         pass
 
@@ -734,6 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def reply_json(self, code: int, body: dict) -> None:
+        self.reply(code, json.dumps(body).encode(), "application/json")
+
     def recording(self, prefix: str) -> Path | None:
         # Only names that are listed in the folder, so a crafted path can never leave it.
         name = unquote(urlparse(self.path).path.removeprefix(prefix))
@@ -742,19 +1073,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/register_service":
-            self.reply(200, json.dumps(REGISTER_SERVICE).encode(), "application/json")
+            self.reply_json(200, REGISTER_SERVICE)
         elif path == "/settings":
-            body = {"min": MIN_PERIOD, "max": MAX_PERIOD, "polls": [
-                {"path": p, "period": periods[p], "default": d, "always": a} for p, d, a in POLLS]}
-            self.reply(200, json.dumps(body).encode(), "application/json")
+            self.reply_json(200, {"min": MIN_PERIOD, "max": MAX_PERIOD, "polls": [
+                {"path": p, "period": periods[p], "default": d, "always": a} for p, d, a in POLLS]})
         elif path == "/status":
-            self.reply(200, json.dumps(status()).encode(), "application/json")
+            self.reply_json(200, status())
         elif path.startswith("/download/") and (file := self.recording("/download/")):
-            self.send_response(200)  # no length: the re-stamped file is built while it streams
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{file.stem}_synced.mcap"')
-            self.end_headers()
-            export(file, self.wfile)
+            if not exporting.acquire(blocking=False):
+                self.reply(503, b"Another download is being prepared, try again when it finishes", "text/plain")
+                return
+            try:
+                self.send_response(200)  # no length: the re-stamped file is built while it streams
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{file.stem}_synced.mcap"')
+                self.end_headers()
+                export(file, self.wfile)
+            finally:
+                exporting.release()
         elif path.startswith("/raw/") and (file := self.recording("/raw/")):
             size = file.stat().st_size  # the active file keeps growing, so send a snapshot
             self.send_response(200)
@@ -772,31 +1108,44 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b"Not found", "text/plain")
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path == "/settings":
+        # Only JSON: a browser can't send that cross-site without a preflight, which this server never approves, so a
+        # page on another site can't change settings or delete recordings.
+        if self.headers.get_content_type() != "application/json":
+            self.reply(415, b"Content-Type must be application/json", "text/plain")
+            return
+        path = urlparse(self.path).path
+        if path == "/settings":
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length)) if 0 < length <= 2**16 else None
             except ValueError:
                 body = None
             error = apply_periods(body.get("poll_periods") if isinstance(body, dict) else None)
-            self.reply(400 if error else 200, json.dumps({"error": error, "file": rec.path.name}).encode(),
-                       "application/json")
-            return
-        if urlparse(self.path).path == "/new_file":
-            finished = rec.rotate()
-            self.reply(200, json.dumps({"finished": finished.name, "file": rec.path.name}).encode(), "application/json")
-            return
-        file = self.recording("/delete/")
-        if file is None or file == rec.path:
+            self.reply_json(400 if error else 200, {"error": error, "file": rec.path.name})
+        elif path == "/new_file":
+            try:
+                finished = rec.rotate()
+            except Exception as error:
+                self.reply_json(500, {"error": f"could not start a new file: {error}", "file": rec.path.name})
+                return
+            self.reply_json(200, {"finished": finished.name, "file": rec.path.name})
+        elif (file := self.recording("/delete/")) is None or file == rec.path:
             self.reply(404, b"No such finished recording", "text/plain")
-            return
-        file.unlink()
-        self.send_response(204)
-        self.end_headers()
+        else:
+            try:
+                file.unlink()
+            except OSError as error:
+                self.reply(500, f"Could not delete it: {error}".encode(), "text/plain")
+                return
+            self.send_response(204)
+            self.end_headers()
 
 
 async def main() -> None:
     global rec
+    # Every poll can have one request in flight, and a few stalled services must not hold up the healthy ones (or the
+    # log scan) in asyncio's default pool of cpus + 4 threads.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(len(POLLS) + 8))
     load_settings()
     rec = Recorder(clock)
     rec.start()
@@ -812,17 +1161,19 @@ async def main() -> None:
     sources["container logs"] = follow_container_logs
     sources["ingest"] = serve_ingest
     sources["disk"] = watch_disk
+    sources["flush"] = keep_flushed
     tasks = [asyncio.create_task(supervise(name, run)) for name, run in sources.items()]
 
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     await stop.wait()
+    # The file first: Docker kills the container 10 s after SIGTERM, and stopping the sources can take a while.
+    rec.event("recording stopped")
+    rec.finish()
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    rec.event("recording stopped")
-    rec.finish()
     server.shutdown()
 
 
