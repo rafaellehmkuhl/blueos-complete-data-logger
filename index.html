@@ -112,7 +112,10 @@
   .stop:hover { background: var(--rec-soft); border-color: var(--rec); }
   .stop.start { color: #fff; background: var(--ok); border-color: var(--ok); }
   .stop.start:hover { background: color-mix(in srgb, var(--ok) 88%, #000); }
-  .stop.busy { opacity: .6; pointer-events: none; }
+  .stop.busy, .btn.ghost.busy { pointer-events: none; animation: waiting 1s ease-in-out infinite; }
+  @keyframes waiting { 50% { opacity: .45; } }
+  .pop { animation: pop .35s cubic-bezier(.2, .8, .2, 1.4); }
+  @keyframes pop { from { transform: scale(.85); opacity: .4; } }
   .new-file.busy svg { animation: spin .8s linear infinite; }
   .new-file.done { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -187,7 +190,6 @@
     padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface);
     animation: rise .4s cubic-bezier(.2, .8, .2, 1) both; transition: border-color .3s, opacity .3s, transform .3s;
   }
-  .rec-item.leaving { opacity: 0; transform: translateX(16px); }
   .rec-item.active { border-color: color-mix(in srgb, var(--rec) 45%, var(--border)); background: linear-gradient(90deg, var(--rec-soft), transparent 60%); }
   .rec-item.active::after {
     content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
@@ -317,8 +319,19 @@
   dialog.confirm {
     width: min(420px, calc(100vw - 32px)); padding: 22px 22px 18px; border: 1px solid var(--border); border-radius: 16px;
     background: var(--surface); color: var(--text); box-shadow: 0 20px 60px #0f1b2d40;
+    opacity: 0; transform: translateY(10px) scale(.97);
+    transition: opacity .2s, transform .25s cubic-bezier(.2, .8, .2, 1), overlay .25s allow-discrete, display .25s allow-discrete;
   }
-  dialog.confirm::backdrop { background: #0d152080; backdrop-filter: blur(2px); }
+  dialog.confirm[open] { opacity: 1; transform: none; }
+  dialog.confirm::backdrop {
+    background: #0d152080; backdrop-filter: blur(2px); opacity: 0;
+    transition: opacity .25s, overlay .25s allow-discrete, display .25s allow-discrete;
+  }
+  dialog.confirm[open]::backdrop { opacity: 1; }
+  @starting-style {
+    dialog.confirm[open] { opacity: 0; transform: translateY(10px) scale(.97); }
+    dialog.confirm[open]::backdrop { opacity: 0; }
+  }
   dialog.confirm h3 { margin: 0 0 8px; font-size: 17px; font-weight: 650; }
   dialog.confirm p { margin: 0; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
   dialog.confirm p code { font: 13px var(--mono); color: var(--text); }
@@ -671,7 +684,17 @@ function renderRecordings(list) {
     }
     li.querySelector("[data-size]").textContent = size(r.size);
   });
-  existing.forEach((li) => { li.classList.add("leaving"); setTimeout(() => li.remove(), 300); });
+  existing.forEach(leave);
+}
+function leave(li) {
+  if (li.dataset.leaving) return;
+  li.dataset.leaving = "1";
+  if (reduced) { li.remove(); return; }
+  li.animate([
+    { opacity: 1, transform: "none", height: `${li.offsetHeight}px` },
+    { opacity: 0, transform: "translateX(16px)", height: `${li.offsetHeight}px`, offset: .5 },
+    { opacity: 0, transform: "translateX(16px)", height: "0px", paddingTop: 0, paddingBottom: 0, borderWidth: 0, marginBottom: "-10px" },
+  ], { duration: 450, easing: "cubic-bezier(.2, .8, .2, 1)" }).onfinish = () => li.remove();
 }
 
 // The download menu lives outside the rows, which clip what overflows them.
@@ -716,8 +739,10 @@ $("recs").addEventListener("click", async (e) => {
   const name = btn.dataset.delete;
   if (!await confirmAction("Delete this recording?",
       `<code>${esc(name)}</code> is deleted from the vehicle. This can't be undone.`, "Delete", true)) return;
+  btn.classList.add("busy");
   const response = await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST", headers: JSON_POST })
     .catch(() => ({ ok: false, text: async () => "The logger is not answering" }));
+  btn.classList.remove("busy");
   if (!response.ok) {
     const tip = btn.dataset.tip;
     btn.classList.replace("ghost", "confirm");
@@ -737,12 +762,14 @@ const START_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="tr
 let stopped = null;
 function renderStop(isStopped) {
   if (isStopped === stopped) return;
+  const changed = stopped !== null;  // not on the first draw
   stopped = isStopped;
   const btn = $("stop");
   btn.classList.toggle("start", isStopped);
   btn.innerHTML = `${isStopped ? START_ICON : STOP_ICON}<span>${isStopped ? "Start" : "Stop"}</span>`;
   btn.dataset.tip = isStopped ? START_TIP : STOP_TIP;
   $("new-file").disabled = isStopped;
+  if (changed) { btn.classList.remove("pop"); void btn.offsetWidth; btn.classList.add("pop"); }
 }
 $("stop").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
