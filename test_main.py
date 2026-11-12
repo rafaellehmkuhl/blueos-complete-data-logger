@@ -34,11 +34,11 @@ def test() -> None:
     log = Path(os.environ["LOG_DIR"]) / "svc" / "service.log"
     log.parent.mkdir()
     log.write_bytes(b"first\nsec")
-    state = [0, b""]
-    main.read_new_lines(log, state, backfill=True)
+    state = [0, b"", log.stat().st_size]  # seen at start: what is already there is backfill
+    main.read_new_lines(log, state)
     with log.open("ab") as f:
-        f.write(b"ond\n")
-    main.read_new_lines(log, state, backfill=False)
+        f.write(b"ond\nthird\n")
+    main.read_new_lines(log, state)
 
     # Another extension logging through the ingest API.
     client = {"name": "unnamed"}
@@ -57,7 +57,9 @@ def test() -> None:
     assert a[1]["corrected_ns"] - a[1]["mono_ns"] - (a[0]["corrected_ns"] - a[0]["mono_ns"]) == HOUR
     # The recorded log_time never jumps when the reference changes: it is mono_ns plus one constant.
     assert len({t - e["mono_ns"] for _, t, e in raw}) == 1
-    assert [e["data"]["line"] for topic, _, e in raw if topic == "/blueos/logs/svc"] == ["first", "second"]
+    logged = [(e["data"]["line"], e["data"]["backfill"]) for topic, _, e in raw if topic == "/blueos/logs/svc"]
+    # "second" started before the logger did, so it is backfill even though it was finished later
+    assert logged == [("first", True), ("second", True), ("third", False)], logged
 
     ext = [e for topic, _, e in raw if topic == "/extensions/My_Ext/time/sync"]
     assert len(ext) == 1 and ext[0]["mono_ns"] == happened and ext[0]["received_mono_ns"] > happened

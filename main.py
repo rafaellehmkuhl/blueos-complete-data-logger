@@ -421,19 +421,25 @@ async def watch_linux_clock() -> None:
         os.close(fd)
 
 
-def read_new_lines(path: Path, state: list, backfill: bool) -> None:
-    offset, partial = state
+def read_new_lines(path: Path, state: list) -> None:
+    """state is [offset read up to, partial last line, size when first seen]: what was there before is backfill."""
+    offset, partial, backfill_until = state
     if path.stat().st_size < offset:  # truncated in place
-        offset = 0
+        offset, backfill_until = 0, 0
     with path.open("rb") as file:
         file.seek(offset)
-        chunk = file.read(4 * 2**20)
+        chunk = file.read(4 * 2**20)  # big files take a few passes, so the event loop never waits on one
+    position = offset - len(partial)
     lines = (partial + chunk).split(b"\n")
-    state[:] = [offset + len(chunk), lines.pop()]
+    state[:] = [offset + len(chunk), lines.pop(), backfill_until]
     for line in lines:
         if line.strip():
             rec.write(f"/blueos/logs/{path.parent.name}",
-                      {"line": line.decode(errors="replace"), "file": path.name, "backfill": backfill})
+                      {"line": line.decode(errors="replace"), "file": path.name, "backfill": position < backfill_until})
+        position += len(line) + 1
+
+
+COMPRESSED = {".gz", ".zip", ".xz", ".bz2", ".zst", ".lz4"}
 
 
 async def tail_service_logs() -> None:
@@ -448,15 +454,17 @@ async def tail_service_logs() -> None:
             seen = set()
             for path in SERVICE_LOGS.glob("*/*"):
                 try:
-                    if path.suffix == ".zip" or not path.is_file():
+                    # Rotated logs get compressed; their lines were already read as text, or are from before.
+                    if path.suffix in COMPRESSED or not path.is_file():
                         continue
                     seen.add(path)
                     if path not in tails:
                         # At start, read whole only what was written since boot, so the boot sequence is in the log.
                         # Files that show up later are new rotations, read whole.
+                        size = path.stat().st_size
                         whole = not first_scan or path.stat().st_mtime > boot_wall
-                        tails[path] = [0 if whole else path.stat().st_size, b""]
-                    read_new_lines(path, tails[path], backfill=first_scan)
+                        tails[path] = [0 if whole else size, b"", size if first_scan else 0]
+                    read_new_lines(path, tails[path])
                 except OSError:  # zipped away mid-scan
                     continue
             for gone in tails.keys() - seen:
