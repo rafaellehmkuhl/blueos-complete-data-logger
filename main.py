@@ -1444,11 +1444,13 @@ async def main() -> None:
     # log scan) in asyncio's default pool of cpus + 4 threads.
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(len(POLLS) + 8))
     load_settings()
+    # The port first: a second logger, or one restarted before the old one let go, fails here without creating a
+    # file, instead of leaving an empty one per restart.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     always = recording_mode["start"] == "always"
     rec = Recorder(clock, record=always)
     if always:
         rec.start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     print(f"Recording to {rec.path}" if always else f"Waiting for {'an arm' if recording_mode['start'] == 'armed' else 'Start'}",
           f"web interface on port {PORT}", sep=", ", flush=True)
