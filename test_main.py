@@ -249,6 +249,102 @@ def test_write_error() -> None:
     assert any(m["data"] == {"v": "before"} for m in kept), "what was synced before the failure stays readable"
 
 
+def test_failing_card() -> None:
+    """A card fails the way cards do: writes go to the page cache, and the error comes from fsync. And recovery
+    attempts on a card that keeps failing leave no empty files behind."""
+    fresh()
+    main.rec.write("/a", 1)
+    real_fsync, real_sleep = main.os.fsync, main.asyncio.sleep
+    main.os.fsync = lambda fd: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+    calls = []
+
+    async def sleep(seconds, *args):
+        calls.append(seconds)
+        if len(calls) > 1:
+            raise asyncio.CancelledError
+    main.asyncio.sleep = sleep
+    try:
+        asyncio.run(main.keep_flushed())
+    except asyncio.CancelledError:
+        pass
+    finally:
+        main.os.fsync, main.asyncio.sleep = real_fsync, real_sleep
+    assert main.rec.write_error and "Input/output" in main.rec.write_error, "an fsync error stops recording visibly"
+
+    before = set(main.LOG_DIR.glob("*.mcap"))
+    real_writer = main.Writer
+    main.Writer = lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+    try:
+        for _ in range(3):
+            assert not main.rec.recover()
+    finally:
+        main.Writer = real_writer
+    assert set(main.LOG_DIR.glob("*.mcap")) == before, "no empty file per failed attempt"
+    assert main.rec.recover()
+    main.rec.finish()
+
+    # A write error in the middle of New file: one new file from recovery, not a stray one left open.
+    fresh()
+    main.rec.writer._Writer__stream = Failing()
+    files = set(main.LOG_DIR.glob("*.mcap"))
+    real_event, main.rec.event = main.rec.event, lambda text: main.rec._failed(OSError(5, "EIO"))
+    try:
+        main.rec.rotate()
+        raise AssertionError("rotate must report the failure")
+    except RuntimeError:
+        pass
+    finally:
+        del main.rec.event
+    assert set(main.LOG_DIR.glob("*.mcap")) == files, "the new file was removed"
+    assert main.rec.recover() and len(set(main.LOG_DIR.glob("*.mcap")) - files) == 1
+    main.rec.finish()
+    assert real_event
+
+
+def test_stopping() -> None:
+    """Once stopping, New file and recovery do nothing: no file is left without its index."""
+    fresh()
+    main.rec.finish()
+    files = set(main.LOG_DIR.glob("*.mcap"))
+    try:
+        main.rec.rotate()
+        raise AssertionError("rotate after finish must refuse")
+    except RuntimeError:
+        pass
+    assert set(main.LOG_DIR.glob("*.mcap")) == files
+
+
+def test_removed_container() -> None:
+    """The error of a container that was removed (an extension uninstalled) leaves the page with it."""
+    fresh()
+    main.rec.errors["docker logs gone"] = "HTTPError 404"
+    real_get, real_sleep = main.get_json, main.asyncio.sleep
+    main.get_json = lambda path: []
+
+    async def stop(seconds, *args):
+        raise asyncio.CancelledError
+    main.asyncio.sleep = stop
+    try:
+        asyncio.run(main.follow_container_logs())
+    except asyncio.CancelledError:
+        pass
+    finally:
+        main.get_json, main.asyncio.sleep = real_get, real_sleep
+    assert "docker logs gone" not in main.rec.errors
+    main.rec.finish()
+
+
+def test_active_download() -> None:
+    """Downloading the file being written is not flagged as a problem: it is read to its last byte."""
+    fresh()
+    main.rec.write("/a", 1)
+    main.rec.flush()
+    out = io.BytesIO()
+    main.export(main.rec.path, out)
+    assert "export_problems" not in metadata(out.getvalue())
+    main.rec.finish()
+
+
 def test_cannot_create_files() -> None:
     """A new file can't be created: the current one keeps recording, and the caller gets the error."""
     fresh()
@@ -293,6 +389,7 @@ def test_topic_limit() -> None:
                              "message": {"type": "HEARTBEAT"}})
         assert len(main.rec.channels) <= 101 and "topics" in main.rec.errors
         finished = main.rec.rotate()
+        assert "topics" not in main.rec.errors, "the limit is per file"
         main.rec.finish()
     finally:
         main.MAX_CHANNELS = limit
@@ -324,6 +421,7 @@ def test_power_cut_download() -> None:
         main.rec.write("/a", {"i": i})
         main.rec.flush()
     main.rec.sync("autopilot", main.clock.shift + HOUR)
+    main.rec.flush()
     main.rec.write("/a", {"i": 5})
     main.rec.flush()
     data = main.rec.path.read_bytes()
@@ -331,7 +429,11 @@ def test_power_cut_download() -> None:
     copy = Path(tempfile.mkdtemp()) / "0001_cut.mcap"
     copy.write_bytes(data[:-20])  # cut in the middle of the last chunk
     out = io.BytesIO()
-    main.export(copy, out)
+    real_boot, main.boot_id = main.boot_id, lambda: "another boot"  # the reference must come from the file itself
+    try:
+        main.export(copy, out)
+    finally:
+        main.boot_id = real_boot
     got = messages(out.getvalue())
     assert [e["data"]["i"] for e in topic(got, "/a")] == [0, 1, 2, 3, 4]
     assert all(e["time_source"] == "autopilot" for _, _, e in got)
@@ -439,6 +541,10 @@ def test_invalid_numbers() -> None:
 
 def test_ingest_limits() -> None:
     fresh()
+    early = {"name": "unnamed"}
+    assert main.ingest(early, {"op": "log"})["op"] == "error" and "ingest unnamed" in main.rec.errors
+    main.ingest(early, {"op": "hello", "name": "sonar"})
+    assert "ingest unnamed" not in main.rec.errors, "a refusal before hello doesn't stay under the old name"
     client = {"name": "c"}
     old = main.time.monotonic_ns() - 3600 * 10**9
     assert main.ingest(client, {"op": "log", "topic": "t", "mono_ns": old})["op"] == "error", "an hour old"

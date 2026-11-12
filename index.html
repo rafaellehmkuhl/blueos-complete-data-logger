@@ -74,8 +74,8 @@
   .state.offline { background: var(--surface-2); color: var(--muted); }
   .state.error { background: var(--rec-soft); color: var(--rec); }
   .rec-dot { position: relative; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
-  .state:not(.paused):not(.offline) .rec-dot { animation: blink 1.6s ease-in-out infinite; }
-  .state:not(.paused):not(.offline) .rec-dot::after {
+  .state:not(.paused):not(.offline):not(.error) .rec-dot { animation: blink 1.6s ease-in-out infinite; }
+  .state:not(.paused):not(.offline):not(.error) .rec-dot::after {
     content: ""; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid currentColor;
     animation: ripple 1.6s ease-out infinite;
   }
@@ -697,14 +697,18 @@ $("recs").addEventListener("click", async (e) => {
   const response = await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST", headers: JSON_POST })
     .catch(() => ({ ok: false, text: async () => "The logger is not answering" }));
   if (!response.ok) {
+    const tip = btn.dataset.tip;
     btn.classList.replace("ghost", "confirm");
     btn.innerHTML = `${icons.trash}Failed`;
     btn.dataset.tip = esc(await response.text());
-    setTimeout(() => { if (btn.isConnected) { btn.classList.replace("confirm", "ghost"); btn.innerHTML = icons.trash; } }, 4000);
+    setTimeout(() => {
+      if (btn.isConnected) { btn.classList.replace("confirm", "ghost"); btn.innerHTML = icons.trash; btn.dataset.tip = tip; }
+    }, 4000);
   }
   refresh();
 });
 
+const newFileTip = $("new-file").dataset.tip;
 $("new-file").addEventListener("click", async (e) => {
   const btn = e.currentTarget, label = btn.querySelector("span");
   if (btn.classList.contains("busy")) return;
@@ -721,7 +725,7 @@ $("new-file").addEventListener("click", async (e) => {
     label.textContent = "Failed, try again";
     btn.dataset.tip = `<strong>Could not start a new file</strong>${esc(error.message)}`;
   }
-  setTimeout(() => { btn.classList.remove("busy", "done"); label.textContent = "New file"; }, 2000);
+  setTimeout(() => { btn.classList.remove("busy", "done"); label.textContent = "New file"; btn.dataset.tip = newFileTip; }, 2000);
 });
 
 // Polling rates: edits stay local until Apply.

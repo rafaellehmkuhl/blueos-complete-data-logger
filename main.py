@@ -249,10 +249,13 @@ class Recorder:
             file.flush()  # the header on the card right away, so the new file reads as MCAP from its first second
         except BaseException:
             file.close()
+            with suppress(OSError):  # no empty file per retry while the card refuses writes
+                path.unlink()
             raise
         return path, file, writer
 
     def _reset(self) -> None:
+        self.errors.pop("topics", None)
         self.channels: dict[str, int] = {}
         self.messages = 0
         # MCAP readers sort by log_time, so within a file it must never jump: mono_ns placed at the best UTC estimate
@@ -283,11 +286,18 @@ class Recorder:
         """Closes the current file and starts the next one, without losing or misplacing a message. Returns the
         finished file. Raises, and keeps recording into the current file, if the next one can't be created."""
         with self.lock:
+            if self.closed:
+                raise RuntimeError("the logger is stopping")
             if self.write_error:
                 raise RuntimeError(f"recording is stopped by a write error: {self.write_error}")
             new = self._new_file()  # first, so a failure leaves the current file recording
             finished = self.path
             self.event("closing this file, recording continues in the next one")
+            if self.write_error:  # that write failed: recovery takes over, the new file is not needed
+                new[1].close()
+                with suppress(OSError):
+                    new[0].unlink()
+                raise RuntimeError(f"recording is stopped by a write error: {self.write_error}")
             self._close()
             self.path, self.file, self.writer = new
             self._reset()
@@ -298,8 +308,8 @@ class Recorder:
     def recover(self) -> bool:
         """After a write error, tries a new file. Returns whether recording goes on."""
         with self.lock:
-            if not self.write_error:
-                return True
+            if not self.write_error or self.closed:
+                return not self.write_error
             try:
                 new = self._new_file()
             except Exception as error:
@@ -427,6 +437,8 @@ class Recorder:
                 os.fsync(self.file.fileno())
         except Exception as error:  # the file stays readable up to its last chunk
             print(f"could not finish {self.path.name}: {error!r}", flush=True)
+            if not self.write_error:
+                self._failed(error)
         finally:
             with suppress(Exception):
                 self.file.close()
@@ -739,6 +751,9 @@ async def follow_container_logs() -> None:
         try:
             containers = await asyncio.to_thread(get_json, "/docker/containers/json")
             rec.errors.pop("/docker/containers/json", None)
+            listed = {f"docker logs {c['Names'][0].lstrip('/')}" for c in containers}
+            for gone in [k for k in rec.errors if k.startswith("docker logs ") and k not in listed]:
+                del rec.errors[gone]  # removed, an extension uninstalled say: nothing left to follow
         except Exception as error:
             rec.errors["/docker/containers/json"] = f"{type(error).__name__}: {error}"
             containers = []
@@ -800,10 +815,17 @@ def records(path: Path, problems: list):
                 yield from found
             return
         file.seek(0)
+        whole = 0  # where the last complete record ends
         try:
-            yield from StreamReader(file).records
-        except Exception as error:  # the unfinished end of the file, or damage
-            problems.append(f"read up to byte {file.tell()} of {path.stat().st_size}: {error!r}")
+            for record in StreamReader(file).records:
+                whole = file.tell()
+                yield record
+        except Exception as error:  # the end of an unfinished file, or damage
+            size = path.stat().st_size
+            # The file being written can end mid-chunk between two flushes: that part comes in the next download.
+            if whole < size and path != getattr(rec, "path", None):
+                problems.append(f"the last {size - whole} bytes, from byte {whole}, could not be read "
+                                f"(cut by a power loss, or damaged): {error!r}")
 
 
 def file_metadata(path: Path) -> dict:
@@ -906,6 +928,8 @@ def ingest(state: dict, message) -> dict | None:
         return {"op": "error", "error": "expected a JSON object"}
     op = message.get("op")
     if op == "hello":
+        rec.errors.pop(f"ingest {state['name']}", None)
+        state.pop("refused", None)
         state["name"] = TOPIC_PART.sub("_", str(message.get("name", ""))).strip("_")[:64] or "unnamed"
         rec.event(f"client {state['name']} connected")
         return None
@@ -974,9 +998,17 @@ async def keep_flushed() -> None:
     while True:
         await asyncio.sleep(FLUSH_S)
         fd = rec.flush()
-        if fd is not None:
-            with suppress(OSError):  # the file was swapped by a new one meanwhile: it was synced as it closed
-                await asyncio.to_thread(os.fsync, fd)
+        if fd is None:
+            continue
+        try:
+            await asyncio.to_thread(os.fsync, fd)
+        except OSError as error:
+            # A failing card takes writes into the page cache and reports the error here, once. EBADF and EINVAL only
+            # mean the file was swapped by a new one meanwhile, and it was synced as it closed.
+            if error.errno not in (errno.EBADF, errno.EINVAL):
+                with rec.lock:
+                    if not rec.write_error and not rec.file.closed and rec.file.fileno() == fd:
+                        rec._failed(error)
 
 
 async def supervise(name: str, run) -> None:
