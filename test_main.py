@@ -513,6 +513,34 @@ def test_power_cut_download() -> None:
     assert meta["time"]["source"] == "autopilot" and "export_problems" in meta
 
 
+def test_recording_times() -> None:
+    """Each recording lists its number, start and end in the best time known for it, also after a later sync and for a
+    file cut by a power loss; the active one has no end yet."""
+    fresh()
+    main.rec.write("/a", {"v": 1})
+    time.sleep(0.05)
+    main.rec.write("/a", {"v": 2})
+    finished = main.rec.rotate()
+    main.rec.sync("autopilot", main.clock.shift + HOUR)  # after the file closed: same boot, so it applies to it too
+    listed = {r["name"]: r for r in main.recordings()}
+    old, active = listed[finished.name], listed[main.rec.path.name]
+    assert old["number"] == int(finished.name[:4]) and old["synced"] and not old["active"]
+    start = main.datetime.fromisoformat(old["start"]).timestamp()
+    linux = (main.time.time_ns() - (main.time.monotonic_ns() - main.file_span(finished)["start_mono"])) / 1e9
+    assert abs(start - (linux + 3600)) < 1, "the start moved to the autopilot's time, an hour ahead of Linux"
+    assert main.datetime.fromisoformat(old["end"]).timestamp() - start >= 0.05
+    assert active["active"] and active["start"] and active["end"] is None and active["synced"]
+
+    main.rec.write("/a", {"v": 3})
+    main.rec.flush()
+    cut = main.LOG_DIR / "9998_cut.mcap"
+    cut.write_bytes(main.rec.path.read_bytes())  # no summary, as after a power loss
+    entry = next(r for r in main.recordings() if r["name"] == cut.name)
+    assert entry["start"] and entry["end"] and entry["synced"]
+    cut.unlink()
+    main.rec.finish()
+
+
 def test_damaged_chunk() -> None:
     """A damaged chunk in a finished file costs only its own messages, and the download says so."""
     fresh()

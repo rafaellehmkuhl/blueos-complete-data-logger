@@ -271,10 +271,11 @@ class Recorder:
     def start(self) -> None:
         """Opens the file with what a reader needs to place it in time on its own."""
         with self.lock:
+            self.start_mono = time.monotonic_ns()
             self._metadata("recording", {
                 "extension_version": VERSION,
                 "boot_id": boot_id() or "unknown",
-                "start_mono_ns": str(time.monotonic_ns()),
+                "start_mono_ns": str(self.start_mono),
                 "start_wall_ns": str(time.time_ns()),
             })
             self._metadata("poll_periods_s", {path: str(period) for path, period in periods.items()})
@@ -877,25 +878,52 @@ def boot_id() -> str | None:
     return None
 
 
-def final_reference(path: Path) -> dict | None:
-    if path == rec.path:
-        return clock.reference()
+spans: dict[Path, tuple] = {}  # path -> ((size, mtime), span): a finished file never changes, so it is read once
+
+
+def file_span(path: Path) -> dict:
+    """What a recording says about its own time: its boot, when it started on mono_ns, how long it lasted, and the
+    best reference it reached."""
+    stat = path.stat()
+    key = (stat.st_size, stat.st_mtime_ns)
+    if (cached := spans.get(path)) and cached[0] == key:
+        return cached[1]
     metadata = file_metadata(path)
-    best = None
-    if "time" in metadata:  # a finished file has the reference it reached in its summary
+    started = metadata.get("recording", {})
+    best = first = last = None
+    if "time" in metadata:  # a finished file has the reference it reached, and its time span, in its summary
         m = metadata["time"]
         best = {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
+        with suppress(Exception), path.open("rb") as file:
+            statistics = make_reader(file).get_summary().statistics
+            first, last = statistics.message_start_time, statistics.message_end_time
     else:  # an unfinished file: the reference only ever improves, so the last /time/sync record is the best one
         channels = {}
         for record in records(path, []):
             if isinstance(record, Channel):
                 channels[record.id] = record.topic
-            elif isinstance(record, Message) and channels.get(record.channel_id) == "/time/sync":
-                data = json.loads(record.data)["data"]
-                best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
+            elif isinstance(record, Message):
+                first, last = min(first or record.log_time, record.log_time), max(last or 0, record.log_time)
+                if channels.get(record.channel_id) == "/time/sync":
+                    data = json.loads(record.data)["data"]
+                    best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
+    span = {"boot_id": started.get("boot_id"),
+            "start_mono": int(started["start_mono_ns"]) if "start_mono_ns" in started else None,
+            # log_time is mono_ns plus a shift fixed for the file, so its span is the file's duration
+            "duration_ns": last - first if first is not None else None,
+            "reference": best}
+    spans[path] = (key, span)
+    return span
+
+
+def final_reference(path: Path) -> dict | None:
+    if path == rec.path:
+        return clock.reference()
+    span = file_span(path)
+    best = span["reference"]
     # mono_ns is the same clock for the whole boot, so a better reference reached since that file closed fixes it too.
     current_boot = boot_id()
-    same_boot = current_boot is not None and metadata.get("recording", {}).get("boot_id") == current_boot
+    same_boot = current_boot is not None and span["boot_id"] == current_boot
     if same_boot and (best is None or RANK[clock.source] > RANK[best["source"]]):
         return clock.reference()
     return best
@@ -1076,10 +1104,29 @@ REGISTER_SERVICE = {
 
 
 def recordings() -> list:
+    """Every recording with its number and when it started and ended, in the best time known for it: the clock that
+    named the file may have been wrong then."""
     found = []
     for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True):
-        with suppress(OSError):  # deleted meanwhile
-            found.append({"name": p.name, "size": p.stat().st_size, "active": p == rec.path and not rec.closed})
+        try:
+            entry = {"name": p.name, "size": p.stat().st_size, "active": p == rec.path and not rec.closed,
+                     "number": int(p.name[:4]) if p.name[:4].isdigit() else None,
+                     "start": None, "end": None, "synced": None}
+        except OSError:  # deleted meanwhile
+            continue
+        try:  # unreadable: listed without times
+            if entry["active"]:
+                start, duration, reference = rec.start_mono, None, clock.reference()
+            else:
+                span = file_span(p)
+                start, duration, reference = span["start_mono"], span["duration_ns"], final_reference(p)
+            if start is not None and reference:
+                entry["start"] = iso(start + reference["shift_ns"])
+                entry["end"] = iso(start + reference["shift_ns"] + duration) if duration is not None else None
+                entry["synced"] = reference["synced"]
+        except Exception:  # damage is already skipped by records(), so this is a file that vanished or can't be opened
+            pass
+        found.append(entry)
     return found
 
 

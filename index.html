@@ -203,9 +203,15 @@
   }
   .rec-item.active .rec-icon { background: var(--rec-soft); color: var(--rec); }
   .rec-icon svg { width: 18px; height: 18px; }
-  .rec-meta { flex: 1 1 220px; min-width: 0; }
-  .rec-name { font: 600 14px var(--mono); overflow-wrap: anywhere; }
-  .rec-sub { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .rec-meta { flex: 1 1 260px; min-width: 0; }
+  .rec-title { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; }
+  .rec-num { font: 650 15px var(--mono); color: var(--muted); }
+  .rec-item.active .rec-num { color: var(--rec); }
+  .rec-when { font-size: 15px; font-weight: 600; }
+  .rec-when.unsynced { color: var(--warn); }
+  .rec-dur { font-size: 13px; color: var(--muted); }
+  .rec-name { font: 12.5px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+  .rec-sub { display: flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; margin-top: 2px; font-size: 13px; color: var(--muted); }
   .tag { padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }
   .tag.live { background: var(--rec-soft); color: var(--rec); }
   .tag.done { background: var(--ok-soft); color: var(--ok); }
@@ -655,7 +661,35 @@ function renderLinks(links, failing, idle, gaps) {
     : `<div class="all-good">${icons.check.replace("<svg", '<svg width="16" height="16"')}Nothing is failing</div>`);
 }
 
-function renderRecordings(list) {
+// Start and end in the viewer's time zone, from the best time the logger knows for the file.
+const dayFmt = new Intl.DateTimeFormat(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value || "";
+function span(ms) {
+  const s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? `${h} h ${String(m).padStart(2, "0")} min` : m ? `${m} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
+}
+function renderWhen(li, r, now) {
+  const when = li.querySelector("[data-when]"), dur = li.querySelector("[data-dur]");
+  if (!r.start) {
+    when.textContent = "Time unknown";
+    when.dataset.tip = "This file doesn't say when it started. Its name has the vehicle's clock at that moment.";
+    dur.textContent = "";
+    return;
+  }
+  const start = new Date(r.start), end = r.end ? new Date(r.end) : null;
+  const sameDay = !end || dayFmt.format(start) === dayFmt.format(end);
+  const text = `${dayFmt.format(start)} · ${timeFmt.format(start)} → ${r.active ? "now"
+    : end ? (sameDay ? "" : `${dayFmt.format(end)} · `) + timeFmt.format(end) : "?"}`;
+  if (when.textContent !== text) when.textContent = text;
+  when.classList.toggle("unsynced", !r.synced);
+  when.dataset.tip = `${r.synced ? "" : "<strong>Approximate</strong>Only the vehicle's own clock is known for this file, which can be far off. "}`
+    + `Start ${esc(r.start.replace("+00:00", "Z"))} UTC${end ? `, end ${esc(r.end.replace("+00:00", "Z"))} UTC` : ""}. Shown in your time zone${zone ? ` (${esc(zone)})` : ""}.`;
+  const endMs = r.active ? now : end?.getTime();
+  dur.textContent = endMs ? span(endMs - start.getTime()) : "";
+}
+
+function renderRecordings(list, now) {
   const ul = $("recs");
   if (!list.length) { ul.innerHTML = '<li class="empty">No recordings yet.</li>'; return; }
   const existing = new Map([...ul.querySelectorAll(".rec-item")].map((li) => [li.dataset.name, li]));
@@ -673,11 +707,15 @@ function renderRecordings(list) {
       fresh.innerHTML = `
         <span class="rec-icon" aria-hidden="true">${r.active ? icons.rec : icons.done}</span>
         <div class="rec-meta">
-          <div class="rec-name">${esc(r.name)}</div>
+          <div class="rec-title">
+            ${r.number != null ? `<span class="rec-num">#${r.number}</span>` : ""}
+            <span class="rec-when num" data-when tabindex="0"></span>
+            <span class="rec-dur num" data-dur></span>
+          </div>
           <div class="rec-sub">${r.active
             ? `<span class="tag live" data-tip="${esc(TIPS.live)}" tabindex="0">Recording</span>`
             : `<span class="tag done" data-tip="${esc(TIPS.done)}" tabindex="0">Finished</span>`}
-            <span class="num" data-size></span></div>
+            <span class="num" data-size></span><span aria-hidden="true">·</span><span class="rec-name">${esc(r.name)}</span></div>
         </div>
         <div class="actions">
           <span class="split">
@@ -697,6 +735,7 @@ function renderRecordings(list) {
       li = fresh;
     }
     li.querySelector("[data-size]").textContent = size(r.size);
+    renderWhen(li, r, now);
   });
   existing.forEach(leave);
 }
@@ -1074,7 +1113,7 @@ async function update() {
   setText("ntp", t.linux_ntp_synced ? "Synchronized" : "Not synchronized");
 
   renderLinks(s.links, s.failing_endpoints, s.idle_s || {}, s.mavlink_gaps || 0);
-  renderRecordings(s.recordings || []);
+  renderRecordings(s.recordings || [], Date.parse(s.time.corrected));
   const liveTag = document.querySelector(".rec-item.active .tag.live");
   if (liveTag) liveTag.textContent = s.write_error ? "Not recording" : s.paused ? "Paused" : "Recording";
 }
