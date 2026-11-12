@@ -59,7 +59,7 @@ Every message is wrapped like this, the same model ArduPilot uses in its datafla
 
 **Download** on the extension page gives every message of the run the best reference the run reached, including messages recorded before the sync. That is possible because `mono_ns` never jumps within a boot, so one shift is right for all of them. In that file `corrected_ns` is the MCAP `log_time`, every message carries the same `time_synced_externally` and `time_source`, and the `time` metadata says which reference was used. This is the file to analyze.
 
-**Raw** gives the file as recorded: there `corrected_ns` is the best reference known at the moment of each message, and the MCAP `log_time` is `mono_ns` placed at the wall time of the start, so it never jumps and never reorders even when the clock is stepped. MCAP readers sort by `log_time`, so a wall-clock `log_time` would put stepped data in the wrong place.
+**Download as recorded**, in the menu next to Download, gives the file exactly as it was written, without that correction: messages from before the clock sync keep the absolute time the vehicle believed then. There `corrected_ns` is the best reference known at the moment of each message, and the MCAP `log_time` is `mono_ns` placed at the wall time of the start, so it never jumps and never reorders even when the clock is stepped. MCAP readers sort by `log_time`, so a wall-clock `log_time` would put stepped data in the wrong place.
 
 ### Clock records
 
@@ -71,7 +71,7 @@ Nothing in the logger reads the wall clock to measure time or name files it depe
 
 ## Using it
 
-The extension page shows the recording live (message rate, topics, the corrected UTC clock, whether the time is synchronized externally and from which source, and any endpoint that is failing) and lists recordings, which you can download synchronized or raw (the active one too, up to its last written chunk) or delete once finished.
+The extension page shows the recording live (message rate, topics, the corrected UTC clock, whether the time is synchronized externally and from which source, and any endpoint that is failing) and lists recordings, which you can download with the time correction applied to the whole run, or as recorded from the menu next to Download (the active one too, up to its last written chunk) or delete once finished.
 
 **New file** closes the current file and continues in a new one from that moment, so a recording can start where the useful data does, with nothing to trim. The new file is complete on its own: it starts with the time reference in use, so it is synchronized from its first message if the vehicle already was, and the state of every service is written again at its start. The same is available as `POST /new_file`.
 
