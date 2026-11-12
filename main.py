@@ -15,6 +15,7 @@ it re-stamps every message with the best reference of the whole run, which also 
 import asyncio
 import ctypes
 import errno
+import http.client
 import io
 import json
 import os
@@ -704,6 +705,10 @@ def follow_container(container: dict, since_ns: int, backfill_until_ns: int, las
     name = container["Names"][0].lstrip("/")
     try:
         stream_container(container, name, since_ns, backfill_until_ns, last_seen)
+    except http.client.IncompleteRead:
+        # BlueOS's proxy cuts a log stream now and then, in the middle of a line. Not a failure: the stream is followed
+        # again from the last whole line recorded, so the cut line comes again, whole.
+        pass
     except Exception as error:
         rec.errors[f"docker logs {name}"] = f"{type(error).__name__}: {error}"
 

@@ -334,6 +334,40 @@ def test_removed_container() -> None:
     main.rec.finish()
 
 
+def test_container_stream_cut() -> None:
+    """The proxy cuts a container's log stream mid-line: what came whole is recorded, the cut is not an error, and the
+    next stream starts after the last whole line, so the cut one comes again."""
+    fresh()
+    line = b"2026-11-11T19:00:00.500000000Z hello\n"
+    stream = io.BytesIO(bytes([1, 0, 0, 0]) + len(line).to_bytes(4, "big") + line + bytes([1, 0, 0, 0, 0, 0, 0, 40]))
+
+    class Cut:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            data = stream.read(n)
+            if len(data) < n and n != 8:
+                raise main.http.client.IncompleteRead(data)
+            return data
+
+    real_open, real_get = main.urllib.request.urlopen, main.get_json
+    main.urllib.request.urlopen = lambda url, timeout=None: Cut()
+    main.get_json = lambda path: {"Config": {"Tty": False}}
+    last_seen = {}
+    try:
+        main.follow_container({"Id": "x", "Names": ["/c"]}, 0, 0, last_seen)
+    finally:
+        main.urllib.request.urlopen, main.get_json = real_open, real_get
+    assert "docker logs c" not in main.rec.errors
+    assert last_seen["c"] == 1794423600_500000000, "the next stream starts after this line"
+    main.rec.finish()
+    assert [e["data"]["line"] for e in topic(messages(main.rec.path.read_bytes()), "/docker/logs/c")] == ["hello"]
+
+
 def test_active_download() -> None:
     """Downloading the file being written is not flagged as a problem: it is read to its last byte."""
     fresh()

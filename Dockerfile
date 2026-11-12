@@ -39,6 +39,10 @@ LABEL requirements="core >= 1.4"
 
 WORKDIR /app
 
+# Each of the ~50 threads (polls, container logs) otherwise gets its own malloc arena, and memory grew for as long as the
+# logger ran while Python's own heap stayed flat. Two arenas keep it flat (measured: ~84 MB, unchanged over 25 min).
+ENV MALLOC_ARENA_MAX=2
+
 COPY requirements.txt .
 # zstandard, lz4 and cffi ship no armv7 wheels, so the compiler is needed there (and removed in the same layer).
 # The Debian mirrors drop connections now and then, so let apt retry.
