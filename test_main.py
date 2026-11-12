@@ -522,7 +522,7 @@ def test_recording_times() -> None:
     main.rec.write("/a", {"v": 2})
     finished = main.rec.rotate()
     main.rec.sync("autopilot", main.clock.shift + HOUR)  # after the file closed: same boot, so it applies to it too
-    listed = {r["name"]: r for r in main.recordings()}
+    listed = {r["name"]: r for r in settled()}
     old, active = listed[finished.name], listed[main.rec.path.name]
     assert old["number"] == int(finished.name[:4]) and old["synced"] and not old["active"]
     start = main.datetime.fromisoformat(old["start"]).timestamp()
@@ -535,10 +535,33 @@ def test_recording_times() -> None:
     main.rec.flush()
     cut = main.LOG_DIR / "9998_cut.mcap"
     cut.write_bytes(main.rec.path.read_bytes())  # no summary, as after a power loss
-    entry = next(r for r in main.recordings() if r["name"] == cut.name)
+    entry = next(r for r in settled() if r["name"] == cut.name)
     assert entry["start"] and entry["end"] and entry["synced"]
     cut.unlink()
     main.rec.finish()
+
+    # A file that takes long to read never holds up the list the page asks for every second.
+    slow = main.LOG_DIR / "9997_slow.mcap"
+    slow.write_bytes(main.rec.path.read_bytes())
+    real, main.file_span = main.file_span, lambda path: (time.sleep(1), real(path))[1]
+    try:
+        started = time.monotonic()
+        entry = next(r for r in main.recordings() if r["name"] == slow.name)
+        assert time.monotonic() - started < 0.5 and entry.get("pending") and entry["start"] is None, (time.monotonic() - started, entry)
+        assert next(r for r in settled() if r["name"] == slow.name)["start"]
+    finally:
+        main.file_span = real
+        slow.unlink()
+
+
+def settled() -> list:
+    """The list once the background reads of file times are done."""
+    for _ in range(100):
+        listed = main.recordings()
+        if not any(r.get("pending") for r in listed):
+            return listed
+        time.sleep(0.05)
+    raise AssertionError("file times never read")
 
 
 def test_damaged_chunk() -> None:

@@ -879,31 +879,39 @@ def boot_id() -> str | None:
 
 
 spans: dict[Path, tuple] = {}  # path -> ((size, mtime), span): a finished file never changes, so it is read once
+# One file at a time, in the background: a big file without an index takes minutes to read on a Pi, and the page asks
+# for the list every second.
+span_reader = ThreadPoolExecutor(1, thread_name_prefix="spans")
+being_read: set[Path] = set()
 
 
 def file_span(path: Path) -> dict:
     """What a recording says about its own time: its boot, when it started on mono_ns, how long it lasted, and the
-    best reference it reached."""
+    best reference it reached. Reads the whole file only when its summary doesn't say."""
     stat = path.stat()
     key = (stat.st_size, stat.st_mtime_ns)
     if (cached := spans.get(path)) and cached[0] == key:
         return cached[1]
-    metadata = file_metadata(path)
-    started = metadata.get("recording", {})
-    best = first = last = None
-    if "time" in metadata:  # a finished file has the reference it reached, and its time span, in its summary
-        m = metadata["time"]
-        best = {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
-        with suppress(Exception), path.open("rb") as file:
-            statistics = make_reader(file).get_summary().statistics
-            first, last = statistics.message_start_time, statistics.message_end_time
-    else:  # an unfinished file: the reference only ever improves, so the last /time/sync record is the best one
-        channels = {}
+    started, best, first, last = {}, None, None, None
+    with suppress(Exception), path.open("rb") as file:  # a finished file: its summary has the span and metadata
+        reader = make_reader(file)
+        statistics = reader.get_summary().statistics
+        first, last = statistics.message_start_time, statistics.message_end_time
+        metadata = {m.name: m.metadata for m in reader.iter_metadata()}
+        started = metadata.get("recording", {})
+        if "time" in metadata:
+            m = metadata["time"]
+            best = {"source": m["source"], "synced": m["synced"] == "True", "shift_ns": int(m["shift_ns"])}
+    if first is None or best is None:  # unfinished, or from a version that didn't write the reference: read it all
+        channels, first, last = {}, None, None
         for record in records(path, []):
-            if isinstance(record, Channel):
+            if isinstance(record, Metadata) and record.name == "recording":
+                started = record.metadata
+            elif isinstance(record, Channel):
                 channels[record.id] = record.topic
             elif isinstance(record, Message):
                 first, last = min(first or record.log_time, record.log_time), max(last or 0, record.log_time)
+                # The reference only ever improves, so the last /time/sync record is the best one.
                 if channels.get(record.channel_id) == "/time/sync":
                     data = json.loads(record.data)["data"]
                     best = {"source": data["source"], "synced": data["synced"], "shift_ns": data["shift_ns"]}
@@ -916,10 +924,32 @@ def file_span(path: Path) -> dict:
     return span
 
 
+def known_span(path: Path) -> dict | None:
+    """The span if it was read already. If not, starts reading it in the background and returns None."""
+    stat = path.stat()
+    if (cached := spans.get(path)) and cached[0] == (stat.st_size, stat.st_mtime_ns):
+        return cached[1]
+    if path not in being_read:
+        being_read.add(path)
+
+        def read() -> None:
+            try:
+                file_span(path)
+            except Exception:  # unreadable: listed without times, not read again until it changes
+                spans[path] = ((stat.st_size, stat.st_mtime_ns),
+                               {"boot_id": None, "start_mono": None, "duration_ns": None, "reference": None})
+            finally:
+                being_read.discard(path)
+
+        span_reader.submit(read)
+    return None
+
+
 def final_reference(path: Path) -> dict | None:
-    if path == rec.path:
-        return clock.reference()
-    span = file_span(path)
+    return clock.reference() if path == rec.path else best_reference(file_span(path))
+
+
+def best_reference(span: dict) -> dict | None:
     best = span["reference"]
     # mono_ns is the same clock for the whole boot, so a better reference reached since that file closed fixes it too.
     current_boot = boot_id()
@@ -1117,9 +1147,11 @@ def recordings() -> list:
         try:  # unreadable: listed without times
             if entry["active"]:
                 start, duration, reference = rec.start_mono, None, clock.reference()
+            elif (span := known_span(p)) is None:
+                entry["pending"] = True
+                start = duration = reference = None
             else:
-                span = file_span(p)
-                start, duration, reference = span["start_mono"], span["duration_ns"], final_reference(p)
+                start, duration, reference = span["start_mono"], span["duration_ns"], best_reference(span)
             if start is not None and reference:
                 entry["start"] = iso(start + reference["shift_ns"])
                 entry["end"] = iso(start + reference["shift_ns"] + duration) if duration is not None else None

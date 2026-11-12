@@ -672,8 +672,9 @@ function span(ms) {
 function renderWhen(li, r, now) {
   const when = li.querySelector("[data-when]"), dur = li.querySelector("[data-dur]");
   if (!r.start) {
-    when.textContent = "Time unknown";
-    when.dataset.tip = "This file doesn't say when it started. Its name has the vehicle's clock at that moment.";
+    when.textContent = r.pending ? "Reading times…" : "Time unknown";
+    when.dataset.tip = r.pending ? "Reading the file to find when it started and ended. Big files from older versions take a while, once."
+      : "This file doesn't say when it started. Its name has the vehicle's clock at that moment.";
     dur.textContent = "";
     return;
   }
