@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 os.environ["LOG_DIR"] = tempfile.mkdtemp()
@@ -825,6 +826,12 @@ def test_http() -> None:
         code, body = call(f"/raw/{main.rec.path.name}")
         assert code == 200 and body.startswith(b"\x89MCAP")
         assert call(f"/download/{main.rec.path.name}")[0] == 200
+        names = [p.name for p in sorted(main.LOG_DIR.glob("*.mcap"))]
+        code, body = call("/download_zip?" + "&".join(f"name={n}" for n in names + ["../settings.json"]))
+        with zipfile.ZipFile(io.BytesIO(body)) as z:
+            assert code == 200 and z.namelist() == [n.replace(".mcap", "_synced.mcap") for n in names]
+            assert all(z.read(n).startswith(b"\x89MCAP") for n in z.namelist())
+        assert call("/download_zip?name=../settings.json")[0] == 404
         with main.exporting:  # one download at a time
             assert call(f"/download/{main.rec.path.name}")[0] == 503
         assert call("/stop", "POST", b"{}", "text/plain")[0] == 415

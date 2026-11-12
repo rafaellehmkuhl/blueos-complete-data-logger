@@ -23,6 +23,7 @@ import re
 import shutil
 import signal
 import time
+import zipfile
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import BoundedSemaphore, RLock, Thread
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # Every source is on localhost, so retry often: the library's default backoff grows to 90 s, which after a BlueOS core
 # restart would leave MAVLink unrecorded for up to a minute after it is back.
@@ -1236,6 +1237,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Disposition", f'attachment; filename="{file.stem}_synced.mcap"')
                 self.end_headers()
                 export(file, self.wfile)
+            finally:
+                exporting.release()
+        elif path == "/download_zip":
+            names = set(parse_qs(urlparse(self.path).query).get("name", []))
+            files = sorted(p for p in LOG_DIR.glob("*.mcap") if p.name in names)  # only listed names, like recording()
+            if not files:
+                self.reply(404, b"None of these recordings exist", "text/plain")
+                return
+            if not exporting.acquire(blocking=False):
+                self.reply(503, b"Another download is being prepared, try again when it finishes", "text/plain")
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="recordings_{len(files)}_synced.zip"')
+                self.end_headers()
+                # Stored, not deflated: the files are already compressed. Streamed, so nothing is staged on the card.
+                with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_STORED) as z:
+                    for file in files:
+                        with z.open(f"{file.stem}_synced.mcap", "w", force_zip64=True) as entry:
+                            export(file, entry)
             finally:
                 exporting.release()
         elif path.startswith("/raw/") and (file := self.recording("/raw/")):

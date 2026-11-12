@@ -216,6 +216,36 @@
   .tag.live { background: var(--rec-soft); color: var(--rec); }
   .tag.done { background: var(--ok-soft); color: var(--ok); }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Selecting several, like a photo gallery */
+  .select-toggle { margin-inline-start: auto; padding: 6px 12px; text-transform: none; letter-spacing: 0; }
+  .select-toggle[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  .pick {
+    appearance: none; flex: none; display: none; place-items: center; width: 26px; height: 26px; margin: 5px;
+    border-radius: 50%; border: 2px solid var(--border); background: var(--surface); cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .pick:checked { background: var(--accent); border-color: var(--accent); }
+  .pick:checked::after { content: ""; width: 6px; height: 11px; border: solid #fff; border-width: 0 2.5px 2.5px 0; transform: translateY(-1px) rotate(45deg); }
+  .pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rec-list.selecting .rec-item:not(.active) .pick { display: grid; animation: pop .3s cubic-bezier(.2, .8, .2, 1.4); }
+  .rec-list.selecting .rec-item:not(.active) .rec-icon { display: none; }
+  .rec-list.selecting .actions { display: none; }
+  .rec-list.selecting .rec-item:not(.active) { cursor: pointer; user-select: none; }
+  .rec-list.selecting .rec-item.active { opacity: .45; }
+  .rec-item.picked { border-color: var(--accent); background: var(--accent-soft); }
+  body.selecting { padding-bottom: 88px; }
+  .select-bar {
+    position: fixed; left: 50%; bottom: 16px; z-index: 8; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    width: max-content; max-width: calc(100vw - 32px); padding: 8px 8px 8px 16px; border-radius: 14px;
+    border: 1px solid var(--border); background: var(--surface); box-shadow: var(--shadow);
+    opacity: 0; transform: translate(-50%, 140%); transition: transform .3s cubic-bezier(.2, .8, .2, 1), opacity .2s;
+  }
+  .select-bar.show { opacity: 1; transform: translate(-50%, 0); }
+  .select-count { margin-inline-end: auto; min-width: 10ch; font-size: 14px; font-weight: 600; }
+  .select-count.bad { color: var(--rec); }
+  .btn.danger { color: var(--rec); }
+  .btn.danger:hover:not(:disabled) { background: var(--rec-soft); border-color: var(--rec); }
+  .btn.danger.busy { pointer-events: none; animation: waiting 1s ease-in-out infinite; }
 
   .btn {
     display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 9px;
@@ -448,9 +478,17 @@
       <h2 id="h-recs">Recordings
         <button class="info" type="button" aria-label="About recordings"
                 data-tip="Stored on the vehicle in &lt;code&gt;/usr/blueos/extensions/complete-data-logger&lt;/code&gt;, numbered in order so they sort right even when the clock was wrong.">i</button>
+        <button class="btn select-toggle" id="select" type="button" aria-pressed="false">Select</button>
       </h2>
       <ul class="rec-list" id="recs"></ul>
     </section>
+    <div class="select-bar" id="select-bar" role="toolbar" aria-label="Selected recordings" inert>
+      <span class="select-count" id="select-count" aria-live="polite"></span>
+      <button class="btn" type="button" id="sel-all">Select all</button>
+      <button class="btn primary" type="button" id="sel-download"
+              data-tip="&lt;strong&gt;Download as .zip&lt;/strong&gt;Each file with the correct UTC time, like the single Download.">Download .zip</button>
+      <button class="btn danger" type="button" id="sel-delete">Delete</button>
+    </div>
 
   </div>
 </main>
@@ -692,7 +730,7 @@ function renderWhen(li, r, now) {
 
 function renderRecordings(list, now) {
   const ul = $("recs");
-  if (!list.length) { ul.innerHTML = '<li class="empty">No recordings yet.</li>'; return; }
+  if (!list.length) { ul.innerHTML = '<li class="empty">No recordings yet.</li>'; afterRecordings(list); return; }
   const existing = new Map([...ul.querySelectorAll(".rec-item")].map((li) => [li.dataset.name, li]));
   ul.querySelector(".empty")?.remove();
   list.forEach((r, i) => {
@@ -706,6 +744,7 @@ function renderRecordings(list, now) {
       fresh.dataset.key = key;
       const enc = encodeURIComponent(r.name);
       fresh.innerHTML = `
+        ${r.active ? "" : `<input type="checkbox" class="pick" aria-label="Select recording ${r.number != null ? `#${r.number}` : esc(r.name)}">`}
         <span class="rec-icon" aria-hidden="true">${r.active ? icons.rec : icons.done}</span>
         <div class="rec-meta">
           <div class="rec-title">
@@ -737,8 +776,11 @@ function renderRecordings(list, now) {
     }
     li.querySelector("[data-size]").textContent = size(r.size);
     renderWhen(li, r, now);
+    const box = li.querySelector(".pick");
+    if (box) { box.checked = selected.has(r.name); li.classList.toggle("picked", box.checked); }
   });
   existing.forEach(leave);
+  afterRecordings(list);
 }
 function leave(li) {
   if (li.dataset.leaving) return;
@@ -787,7 +829,94 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && menuFor)
 addEventListener("scroll", () => closeMenu(), { passive: true });
 addEventListener("resize", () => closeMenu());
 
+// Selecting several finished recordings to download as one .zip or delete together.
+const selected = new Set();
+let selecting = false;
+function afterRecordings(list) {
+  const finished = new Set(list.filter((r) => !r.active).map((r) => r.name));
+  for (const name of selected) if (!finished.has(name)) selected.delete(name);
+  if (selecting && !finished.size) setSelecting(false);
+  $("select").disabled = !selecting && !finished.size;
+  if (selecting) renderSelection();
+}
+function setSelecting(on) {
+  selecting = on;
+  selected.clear();
+  document.querySelectorAll("#recs .pick").forEach((box) => { box.checked = false; box.closest("li").classList.remove("picked"); });
+  $("recs").classList.toggle("selecting", on);
+  document.body.classList.toggle("selecting", on);
+  const toggle = $("select");
+  toggle.textContent = on ? "Cancel" : "Select";
+  toggle.setAttribute("aria-pressed", on);
+  $("select-bar").classList.toggle("show", on);
+  $("select-bar").inert = !on;
+  $("select-count").classList.remove("bad");
+  closeMenu();
+  hideTip();
+  renderSelection();
+}
+function pickable() { return [...document.querySelectorAll("#recs .rec-item:not(.active):not([data-leaving])")]; }
+function pick(li, on) {
+  li.querySelector(".pick").checked = on;
+  li.classList.toggle("picked", on);
+  on ? selected.add(li.dataset.name) : selected.delete(li.dataset.name);
+}
+function renderSelection() {
+  const n = selected.size, rows = pickable();
+  if (!$("select-count").classList.contains("bad")) $("select-count").textContent = n ? `${n} selected` : "Select recordings";
+  $("sel-download").disabled = $("sel-delete").disabled = !n;
+  $("sel-all").textContent = rows.length && rows.every((li) => selected.has(li.dataset.name)) ? "Deselect all" : "Select all";
+}
+$("select").addEventListener("click", () => setSelecting(!selecting));
+$("sel-download").insertAdjacentHTML("afterbegin", icons.down);
+$("sel-delete").insertAdjacentHTML("afterbegin", icons.trash);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && selecting && !menuFor && !document.querySelector("dialog[open]")) setSelecting(false);
+});
+$("sel-all").addEventListener("click", () => {
+  const rows = pickable(), all = rows.every((li) => selected.has(li.dataset.name));
+  rows.forEach((li) => pick(li, !all));
+  $("select-count").classList.remove("bad");
+  renderSelection();
+});
+$("sel-download").addEventListener("click", () => {
+  const a = document.createElement("a");  // the server says it's an attachment, so the page stays
+  a.href = `download_zip?${[...selected].map((n) => `name=${encodeURIComponent(n)}`).join("&")}`;
+  a.click();
+  setSelecting(false);
+});
+$("sel-delete").addEventListener("click", async (e) => {
+  const btn = e.currentTarget, names = [...selected], n = names.length;
+  if (!await confirmAction(n === 1 ? "Delete this recording?" : `Delete ${n} recordings?`,
+      `${n === 1 ? `<code>${esc(names[0])}</code> is` : `These ${n} files are`} deleted from the vehicle. This can't be undone.`,
+      "Delete", true)) return;
+  btn.classList.add("busy");
+  const failed = [];
+  for (const name of names) {
+    const response = await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST", headers: JSON_POST }).catch(() => null);
+    if (!response?.ok) failed.push(name);
+  }
+  btn.classList.remove("busy");
+  if (!failed.length) setSelecting(false);
+  else {
+    pickable().forEach((li) => pick(li, failed.includes(li.dataset.name)));
+    $("select-count").textContent = `Couldn't delete ${failed.length}`;
+    $("select-count").classList.add("bad");
+    renderSelection();
+  }
+  refresh();
+});
+
 $("recs").addEventListener("click", async (e) => {
+  if (selecting) {
+    const li = e.target.closest(".rec-item:not(.active)");
+    if (!li || li.dataset.leaving) return;
+    const box = li.querySelector(".pick");
+    pick(li, e.target === box ? box.checked : !box.checked);  // the box toggles itself; the rest of the row toggles it
+    $("select-count").classList.remove("bad");
+    renderSelection();
+    return;
+  }
   const btn = e.target.closest("[data-delete]");
   if (!btn) return;
   const name = btn.dataset.delete;
