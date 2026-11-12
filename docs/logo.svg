@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Single File Logger for BlueOS logo">
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b8fe0"/>
+      <stop offset="1" stop-color="#0a3d7a"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e3f0fb"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#sea)"/>
+  <!-- streams flowing in from the left -->
+  <g fill="none" stroke="#7cc4f5" stroke-width="7" stroke-linecap="round" opacity="0.85">
+    <path d="M18 92 C48 92 52 112 78 112"/>
+    <path d="M18 128 H78"/>
+    <path d="M18 164 C48 164 52 144 78 144"/>
+  </g>
+  <!-- the single file -->
+  <path d="M84 46 H160 L202 88 V202 a12 12 0 0 1 -12 12 H84 a12 12 0 0 1 -12 -12 V58 a12 12 0 0 1 12 -12 Z" fill="url(#paper)"/>
+  <path d="M160 46 V76 a12 12 0 0 0 12 12 H202 Z" fill="#b9dcf6"/>
+  <!-- recorded signal -->
+  <path d="M90 140 H112 L124 108 L140 172 L154 124 L164 140 H186" fill="none" stroke="#0a3d7a" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- recording dot -->
+  <circle cx="186" cy="196" r="22" fill="#0a3d7a"/>
+  <circle cx="186" cy="196" r="12" fill="#ff4d4f"/>
+</svg>
