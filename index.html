@@ -313,6 +313,19 @@
   .btn:disabled { opacity: .45; cursor: not-allowed; }
   .btn.primary.done { background: var(--ok); border-color: var(--ok); }
 
+  /* Confirmation */
+  dialog.confirm {
+    width: min(420px, calc(100vw - 32px)); padding: 22px 22px 18px; border: 1px solid var(--border); border-radius: 16px;
+    background: var(--surface); color: var(--text); box-shadow: 0 20px 60px #0f1b2d40;
+  }
+  dialog.confirm::backdrop { background: #0d152080; backdrop-filter: blur(2px); }
+  dialog.confirm h3 { margin: 0 0 8px; font-size: 17px; font-weight: 650; }
+  dialog.confirm p { margin: 0; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+  dialog.confirm p code { font: 13px var(--mono); color: var(--text); }
+  dialog.confirm .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .btn.danger { background: var(--rec); border-color: var(--rec); color: #fff; }
+  .btn.danger:hover { background: color-mix(in srgb, var(--rec) 88%, #000); }
+
   .bump { animation: bump .45s ease; }
   @keyframes bump { 40% { color: var(--accent); } }
 
@@ -443,6 +456,16 @@
     <span>No time correction: messages from before the clock sync keep the time the vehicle believed then.</span>
   </a>
 </div>
+<dialog class="confirm" id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-text"></p>
+    <div class="buttons">
+      <button class="btn" value="cancel" autofocus>Cancel</button>
+      <button class="btn primary" value="ok" id="confirm-ok"></button>
+    </div>
+  </form>
+</dialog>
 <div class="tip" id="tip" role="tooltip"></div>
 
 <script>
@@ -605,7 +628,6 @@ function renderLinks(links, failing, idle, gaps) {
     : `<div class="all-good">${icons.check.replace("<svg", '<svg width="16" height="16"')}Nothing is failing</div>`);
 }
 
-const armed = new Set();
 function renderRecordings(list) {
   const ul = $("recs");
   if (!list.length) { ul.innerHTML = '<li class="empty">No recordings yet.</li>'; return; }
@@ -641,7 +663,7 @@ function renderRecordings(list) {
                 data-tip="The file being recorded can't be deleted. It can once the logger moves on to a new file."
                 aria-label="Delete ${esc(r.name)}, unavailable while recording">${icons.trash}</button>`
             : `<button class="btn ghost" type="button" data-delete="${esc(r.name)}"
-                data-tip="Deletes this file from the vehicle. Click twice to confirm. Can't be undone."
+                data-tip="Deletes this file from the vehicle. Can't be undone."
                 aria-label="Delete ${esc(r.name)}">${icons.trash}</button>`}
         </div>`;
       if (li) li.replaceWith(fresh); else ul.insertBefore(fresh, ul.children[i] || null);
@@ -692,18 +714,8 @@ $("recs").addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-delete]");
   if (!btn) return;
   const name = btn.dataset.delete;
-  if (!armed.has(name)) {
-    armed.add(name);
-    btn.classList.replace("ghost", "confirm");
-    btn.innerHTML = `${icons.trash}Delete?`;
-    setTimeout(() => {
-      armed.delete(name);
-      if (btn.isConnected) { btn.classList.replace("confirm", "ghost"); btn.innerHTML = icons.trash; }
-    }, 4000);
-    return;
-  }
-  armed.delete(name);
-  hideTip();
+  if (!await confirmAction("Delete this recording?",
+      `<code>${esc(name)}</code> is deleted from the vehicle. This can't be undone.`, "Delete", true)) return;
   const response = await fetch(`delete/${encodeURIComponent(name)}`, { method: "POST", headers: JSON_POST })
     .catch(() => ({ ok: false, text: async () => "The logger is not answering" }));
   if (!response.ok) {
@@ -738,6 +750,12 @@ $("stop").addEventListener("click", async (e) => {
   btn.classList.add("busy");
   hideTip();
   const action = stopped ? "start" : "stop";
+  if (action === "stop" && !await confirmAction("Stop recording?",
+      "The current file is closed and <b>nothing is recorded</b> until you press Start. Use it when something is wrong, like the card running out of space.",
+      "Stop recording", true)) {
+    btn.classList.remove("busy");
+    return;
+  }
   try {
     const response = await fetch(action, { method: "POST", headers: JSON_POST });
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
@@ -751,12 +769,29 @@ $("stop").addEventListener("click", async (e) => {
   refresh();
 });
 
+// Asks before anything that ends a file or can't be undone. Resolves to whether the user confirmed.
+function confirmAction(title, html, action, danger = false) {
+  const dialog = $("confirm");
+  $("confirm-title").textContent = title;
+  $("confirm-text").innerHTML = html;
+  $("confirm-ok").textContent = action;
+  $("confirm-ok").className = `btn ${danger ? "danger" : "primary"}`;
+  hideTip();
+  closeMenu();
+  dialog.returnValue = "";
+  dialog.showModal();
+  return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true }));
+}
+$("confirm").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });  // the backdrop
+
 const newFileTip = $("new-file").dataset.tip;
 $("new-file").addEventListener("click", async (e) => {
   const btn = e.currentTarget, label = btn.querySelector("span");
   if (btn.classList.contains("busy")) return;
+  if (!await confirmAction("Start a new file?",
+      `<code>${esc(last?.file || "The current file")}</code> is closed and recording continues in a new file from now.`,
+      "New file")) return;
   btn.classList.add("busy");
-  hideTip();
   try {
     const response = await fetch("new_file", { method: "POST", headers: JSON_POST });
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
@@ -866,8 +901,10 @@ $("polls-apply").addEventListener("click", async () => {
     const state = pollState(poll);
     if (state.changed) changed[poll.path] = state.value;
   }
+  if (!await confirmAction("Apply and start a new file?",
+      `${Object.keys(changed).length} polling rate${Object.keys(changed).length > 1 ? "s" : ""} change. The current file is closed and recording continues in a new file with the new rates.`,
+      "Apply")) return;
   btn.disabled = true;
-  hideTip();
   const response = await fetch("settings", { method: "POST", headers: JSON_POST, body: JSON.stringify({ poll_periods: changed }) })
     .catch(() => null);
   const result = response ? await response.json().catch(() => ({ error: response.statusText })) : { error: "The logger is not answering. Try again." };
