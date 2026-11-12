@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/logo.svg" width="128" alt="Logo: a single file receiving several data streams, with a recording dot"></p>
+<p align="center"><img src="docs/logo.png" width="160" alt="Logo: a blue database with a red record button and a data stream around it"></p>
 
 # Single File Logger
 
