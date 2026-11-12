@@ -151,6 +151,8 @@ def apply_periods(new) -> str | None:
         return f"could not save the settings: {error}"
     periods.update(new)
     rec.event(f"poll periods changed: {json.dumps(changed)}")
+    if rec.stopped:  # the next file, when recording starts again, uses them
+        return None
     try:
         rec.rotate()
     except Exception as error:
@@ -225,7 +227,8 @@ class Recorder:
         self.lock = RLock()
         self.dropped = 0  # messages not recorded: while paused for disk space or after a write error
         self.paused = False
-        self.closed = False  # finished for good: the logger is stopping
+        self.closed = False  # the file is finished and nothing is written: the logger is stopping, or stopped
+        self.stopped = False  # stopped from the page, until started again from there
         self.write_error: str | None = None  # the writer failed: nothing is recorded until a new file opens
         self.errors: dict[str, str] = {}  # what is failing, shown on the page
         self.links: dict[str, str] = {}
@@ -288,7 +291,7 @@ class Recorder:
         finished file. Raises, and keeps recording into the current file, if the next one can't be created."""
         with self.lock:
             if self.closed:
-                raise RuntimeError("the logger is stopping")
+                raise RuntimeError("recording is stopped" if self.stopped else "the logger is stopping")
             if self.write_error:
                 raise RuntimeError(f"recording is stopped by a write error: {self.write_error}")
             new = self._new_file()  # first, so a failure leaves the current file recording
@@ -326,6 +329,30 @@ class Recorder:
             self.event(f"recording resumed in a new file after a write error ({failure}). Not recorded: {lost} "
                        f"messages, plus the last {FLUSH_S} s before the error")
         return True
+
+    def stop(self) -> None:
+        """The emergency stop on the page: the file is finished whole and nothing more is written, not even to a new
+        file, until restart(). Not kept across restarts of the logger, so a reboot never leaves a run unrecorded."""
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("not recording")
+            self.event("recording stopped from the page")
+            self.finish()
+            self.stopped, self.dropped_at_stop = True, self.dropped
+
+    def restart(self) -> None:
+        """Recording again after stop(), in a new file. Raises, and stays stopped, if the file can't be created."""
+        with self.lock:
+            if not self.stopped:
+                raise RuntimeError("already recording")
+            self.path, self.file, self.writer = self._new_file()
+            self.closed = self.stopped = False
+            self.write_error = None  # any failure was in the finished file
+            self.errors.pop("recording", None)
+            self._reset()
+            self.start()
+            self.event(f"recording started from the page, after {self.dropped - self.dropped_at_stop} messages "
+                       f"not recorded while stopped")
 
     def resume(self) -> None:
         """Recording again after a pause for disk space: what is only written on change is written again, so the file
@@ -425,6 +452,8 @@ class Recorder:
 
     def finish(self) -> None:
         with self.lock:
+            if self.closed:  # already finished by stop()
+                return
             self.closed = True  # threads still running get dropped from here on
             self._close()
 
@@ -949,8 +978,9 @@ def ingest(state: dict, message) -> dict | None:
         if mono is not None and (type(mono) is not int or not now - MAX_PAST_NS <= mono <= now + MAX_FUTURE_NS):
             return refuse(state, "mono_ns must be our CLOCK_MONOTONIC in ns, from a sync, not in the future and "
                                  "not over 10 minutes old")
-        if rec.paused or rec.write_error:
-            return refuse(state, "recording is paused: " + (rec.write_error or "disk full"))
+        if rec.stopped or rec.paused or rec.write_error:
+            return refuse(state, "recording is stopped from the page" if rec.stopped else
+                          "recording is paused: " + (rec.write_error or "disk full"))
         # Always under the sender's own namespace, so nobody can write into /time or /mavlink.
         rec.write(f"/extensions/{state['name']}/{'/'.join(parts)[:200]}", message.get("data"), mono=mono)
         if state.pop("refused", None):
@@ -1049,7 +1079,7 @@ def recordings() -> list:
     found = []
     for p in sorted(LOG_DIR.glob("*.mcap"), reverse=True):
         with suppress(OSError):  # deleted meanwhile
-            found.append({"name": p.name, "size": p.stat().st_size, "active": p == rec.path})
+            found.append({"name": p.name, "size": p.stat().st_size, "active": p == rec.path and not rec.closed})
     return found
 
 
@@ -1065,6 +1095,7 @@ def status() -> dict:
         "messages": rec.messages,
         "topics": len(rec.channels),
         "paused": rec.paused,
+        "stopped": rec.stopped,
         "write_error": rec.write_error,
         "dropped": rec.dropped,
         "links": rec.links,
@@ -1166,7 +1197,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply_json(500, {"error": f"could not start a new file: {error}", "file": rec.path.name})
                 return
             self.reply_json(200, {"finished": finished.name, "file": rec.path.name})
-        elif (file := self.recording("/delete/")) is None or file == rec.path:
+        elif path in ("/stop", "/start"):
+            try:
+                rec.stop() if path == "/stop" else rec.restart()
+            except Exception as error:
+                self.reply_json(500, {"error": f"could not {path[1:]} recording: {error}"})
+                return
+            self.reply_json(200, {"stopped": rec.stopped, "file": rec.path.name})
+        elif (file := self.recording("/delete/")) is None or (file == rec.path and not rec.closed):
             self.reply(404, b"No such finished recording", "text/plain")
         else:
             try:

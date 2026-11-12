@@ -71,11 +71,11 @@
     background: var(--rec-soft); color: var(--rec); transition: background .4s, color .4s;
   }
   .state.paused { background: var(--warn-soft); color: var(--warn); }
-  .state.offline { background: var(--surface-2); color: var(--muted); }
+  .state.offline, .state.stopped { background: var(--surface-2); color: var(--muted); }
   .state.error { background: var(--rec-soft); color: var(--rec); }
   .rec-dot { position: relative; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
-  .state:not(.paused):not(.offline):not(.error) .rec-dot { animation: blink 1.6s ease-in-out infinite; }
-  .state:not(.paused):not(.offline):not(.error) .rec-dot::after {
+  .state:not(.paused):not(.offline):not(.error):not(.stopped) .rec-dot { animation: blink 1.6s ease-in-out infinite; }
+  .state:not(.paused):not(.offline):not(.error):not(.stopped) .rec-dot::after {
     content: ""; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid currentColor;
     animation: ripple 1.6s ease-out infinite;
   }
@@ -106,7 +106,13 @@
     display: flex; align-items: center; gap: 8px; margin: 0 0 14px;
     font-size: 12px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
   }
-  .new-file { margin-inline-start: auto; padding: 6px 12px; text-transform: none; letter-spacing: 0; }
+  .new-file { margin-inline-start: auto; }
+  .new-file, .stop { padding: 6px 12px; text-transform: none; letter-spacing: 0; }
+  .stop { color: var(--rec); }
+  .stop:hover { background: var(--rec-soft); border-color: var(--rec); }
+  .stop.start { color: #fff; background: var(--ok); border-color: var(--ok); }
+  .stop.start:hover { background: color-mix(in srgb, var(--ok) 88%, #000); }
+  .stop.busy { opacity: .6; pointer-events: none; }
   .new-file.busy svg { animation: spin .8s linear infinite; }
   .new-file.done { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -347,13 +353,17 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M12 12v6m-3-3h6"/></svg>
           <span>New file</span>
         </button>
+        <button class="btn stop" id="stop" type="button" data-tip="">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          <span>Stop</span>
+        </button>
       </h2>
       <div class="stats">
         <div class="stat" data-tip="Messages written to the current file since it started."><span class="value num" id="messages">–</span><span class="label">messages</span></div>
         <div class="stat" data-tip="Messages per second, averaged over the last few seconds."><span class="value num" id="rate">–</span><span class="label">per second</span></div>
         <div class="stat growth" id="growth-tile" data-tip="How fast the file grows, averaged over the last 30 seconds."><span class="value num" id="growth">–</span><span class="label">file growth</span></div>
         <div class="stat" data-tip="Topics in the file, like &lt;code&gt;/mavlink/1/1/ATTITUDE&lt;/code&gt; or &lt;code&gt;/docker/logs/core&lt;/code&gt;."><span class="value num" id="topics">–</span><span class="label">topics</span></div>
-        <div class="stat" data-tip="Messages not recorded, while the disk was too full or writing to the card failed. Recording resumes on its own."><span class="value num" id="dropped">–</span><span class="label">dropped</span></div>
+        <div class="stat" data-tip="Messages not recorded: while stopped, while the disk was too full, or while writing to the card failed."><span class="value num" id="dropped">–</span><span class="label">dropped</span></div>
       </div>
       <svg class="spark" id="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true">
         <path class="area" id="spark-area"/><path class="line" id="spark-line"/>
@@ -708,6 +718,39 @@ $("recs").addEventListener("click", async (e) => {
   refresh();
 });
 
+const STOP_TIP = "<strong>Stop recording</strong>For emergencies, like a card running out of space or misbehaving: the current file is closed whole and nothing more is written until you press Start. Recording also starts again on its own when the vehicle or the extension restarts.";
+const START_TIP = "<strong>Start recording</strong>Continues in a new file. Nothing was recorded while stopped.";
+const STOP_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+const START_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="7"/></svg>';
+let stopped = null;
+function renderStop(isStopped) {
+  if (isStopped === stopped) return;
+  stopped = isStopped;
+  const btn = $("stop");
+  btn.classList.toggle("start", isStopped);
+  btn.innerHTML = `${isStopped ? START_ICON : STOP_ICON}<span>${isStopped ? "Start" : "Stop"}</span>`;
+  btn.dataset.tip = isStopped ? START_TIP : STOP_TIP;
+  $("new-file").disabled = isStopped;
+}
+$("stop").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (btn.classList.contains("busy")) return;
+  btn.classList.add("busy");
+  hideTip();
+  const action = stopped ? "start" : "stop";
+  try {
+    const response = await fetch(action, { method: "POST", headers: JSON_POST });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
+    renderStop((await response.json()).stopped);
+  } catch (error) {
+    btn.querySelector("span").textContent = "Failed, try again";
+    btn.dataset.tip = `<strong>Could not ${action} recording</strong>${esc(error.message)}`;
+    stopped = null;  // the next status redraws it
+  }
+  btn.classList.remove("busy");
+  refresh();
+});
+
 const newFileTip = $("new-file").dataset.tip;
 $("new-file").addEventListener("click", async (e) => {
   const btn = e.currentTarget, label = btn.querySelector("span");
@@ -867,15 +910,21 @@ async function update() {
   const now = performance.now();
 
   const state = $("state");
-  state.className = `state${s.write_error ? " error" : s.paused ? " paused" : ""}`;
-  $("state-text").textContent = s.write_error ? "NOT RECORDING" : s.paused ? "PAUSED" : "REC";
-  state.dataset.tip = s.write_error
+  state.className = `state${s.stopped ? " stopped" : s.write_error ? " error" : s.paused ? " paused" : ""}`;
+  $("state-text").textContent = s.stopped ? "STOPPED" : s.write_error ? "NOT RECORDING" : s.paused ? "PAUSED" : "REC";
+  state.dataset.tip = s.stopped
+    ? "<strong>Stopped</strong>Recording was stopped from this page. Nothing is being recorded until you press Start."
+    : s.write_error
     ? `<strong>Not recording</strong>Writing to the card failed: ${esc(s.write_error)}. A new file is tried every 10 seconds.`
     : s.paused
     ? "<strong>Paused</strong>The disk is almost full. Recording resumes on its own once there is space again."
     : "<strong>Recording</strong>Everything is being written to the current file.";
-  $("write-error").classList.toggle("show", !!s.write_error);
-  $("write-error-text").textContent = s.write_error
+  renderStop(!!s.stopped);
+  $("write-error").classList.toggle("bad", !s.stopped);
+  $("write-error").classList.toggle("show", !!(s.write_error || s.stopped));
+  $("write-error-text").textContent = s.stopped
+    ? "Recording is stopped. Nothing is being recorded until you press Start."
+    : s.write_error
     ? `Nothing is being recorded: writing to the card failed (${s.write_error}). The card may be failing. A new file is tried every 10 seconds.`
     : "";
   $("version").textContent = s.version ? `Version ${s.version}` : "";
@@ -893,7 +942,7 @@ async function update() {
   $("messages").parentElement.dataset.tip = `${fmt.format(s.messages)} messages written to the current file since it started.`;
   tween("topics", s.topics, (v) => String(Math.round(v)));  // up to 4 digits, no separator to fit its tile
   tween("dropped", s.dropped, short);
-  $("dropped").parentElement.dataset.tip = `${fmt.format(s.dropped)} messages not recorded, while the disk was too full or writing to the card failed. Recording resumes on its own.`;
+  $("dropped").parentElement.dataset.tip = `${fmt.format(s.dropped)} messages not recorded: while stopped, while the disk was too full, or while writing to the card failed.`;
   $("file").textContent = s.file;
 
   // File growth over the last 30 s: the file grows in chunks every few seconds, so a shorter window jumps around.
@@ -902,6 +951,8 @@ async function update() {
     if (sizes.length && sizes[0].file !== active.name) sizes.length = 0;
     sizes.push({ file: active.name, at: now, size: active.size });
     while (sizes.length > 2 && now - sizes[0].at > 30000) sizes.shift();
+  } else {
+    sizes.length = 0;  // stopped: nothing grows
   }
   const span = sizes.length > 1 ? (sizes.at(-1).at - sizes[0].at) / 1000 : 0;
   const growth = span >= 5 ? Math.max(0, (sizes.at(-1).size - sizes[0].size) / span) : null;

@@ -314,6 +314,44 @@ def test_stopping() -> None:
     assert set(main.LOG_DIR.glob("*.mcap")) == files
 
 
+def test_stop_and_start() -> None:
+    """The emergency stop: the file is finished whole, nothing is written or created until Start, which opens a new
+    file. A stopped file can be deleted to free the card, and a shutdown while stopped is clean."""
+    fresh()
+    main.rec.write("/a", {"v": 1})
+    stopped = main.rec.path
+    main.rec.stop()
+    main.rec.write("/a", {"v": 2})
+    files = set(main.LOG_DIR.glob("*.mcap"))
+    for refused in (main.rec.rotate, main.rec.stop):
+        try:
+            refused()
+            raise AssertionError(f"{refused.__name__} while stopped must refuse")
+        except RuntimeError:
+            pass
+    main.rec.recover()
+    assert set(main.LOG_DIR.glob("*.mcap")) == files, "no file is created while stopped"
+    assert main.ingest({"name": "x"}, {"op": "log", "topic": "t", "data": 1})["op"] == "error"
+    assert [r["active"] for r in main.recordings() if r["name"] == stopped.name] == [False]
+    old = messages(stopped.read_bytes())  # finished, with its summary
+    assert [e["data"]["v"] for e in topic(old, "/a")] == [1]
+    assert "recording stopped from the page" in [e["data"]["event"] for e in topic(old, "/logger/events")]
+
+    main.rec.restart()
+    assert main.rec.path != stopped and not main.rec.stopped
+    main.rec.write("/a", {"v": 3})
+    try:
+        main.rec.restart()
+        raise AssertionError("start while recording must refuse")
+    except RuntimeError:
+        pass
+    main.rec.stop()
+    main.rec.finish()  # SIGTERM while stopped
+    new = messages(main.rec.path.read_bytes())
+    assert [e["data"]["v"] for e in topic(new, "/a")] == [3]
+    assert any("messages not recorded while stopped" in e["data"]["event"] for e in topic(new, "/logger/events"))
+
+
 def test_removed_container() -> None:
     """The error of a container that was removed (an extension uninstalled) leaves the page with it."""
     fresh()
@@ -718,7 +756,7 @@ def test_http() -> None:
     try:
         code, body = call("/status")
         status = json.loads(body)
-        for key in ("file", "messages", "topics", "paused", "write_error", "dropped", "links", "idle_s",
+        for key in ("file", "messages", "topics", "paused", "stopped", "write_error", "dropped", "links", "idle_s",
                     "mavlink_gaps", "failing_endpoints", "time", "version", "disk", "recordings"):
             assert key in status, key  # what index.html reads
         assert call("/")[0] == 200 and call("/settings")[0] == 200
@@ -738,6 +776,13 @@ def test_http() -> None:
         assert call(f"/download/{main.rec.path.name}")[0] == 200
         with main.exporting:  # one download at a time
             assert call(f"/download/{main.rec.path.name}")[0] == 503
+        assert call("/stop", "POST", b"{}", "text/plain")[0] == 415
+        stopped = main.rec.path.name
+        assert call("/stop", "POST", b"{}")[0] == 200 and json.loads(call("/status")[1])["stopped"]
+        assert call("/stop", "POST", b"{}")[0] == 500
+        assert call(f"/delete/{stopped}", "POST", b"{}")[0] == 204, "a stopped file can be deleted to free space"
+        code, body = call("/start", "POST", b"{}")
+        assert code == 200 and json.loads(body)["file"] != stopped and not json.loads(body)["stopped"]
     finally:
         server.shutdown()
         main.rec.finish()
