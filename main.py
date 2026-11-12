@@ -119,6 +119,7 @@ DEFAULT_PERIODS = {path: period for path, period, _ in POLLS}
 periods = dict(DEFAULT_PERIODS)  # what the user set, in seconds
 MIN_PERIOD, MAX_PERIOD = 0.1, 3600
 SETTINGS = LOG_DIR / "settings.json"
+auto_record = True  # record from the moment the logger starts; off, it waits for Start on the page
 
 
 def valid_period(value) -> bool:
@@ -126,11 +127,41 @@ def valid_period(value) -> bool:
 
 
 def load_settings() -> None:
+    global auto_record
     try:
-        saved = json.loads(SETTINGS.read_text()).get("poll_periods", {})
-    except (OSError, ValueError, AttributeError):
+        saved = json.loads(SETTINGS.read_text())
+    except (OSError, ValueError):
         return
-    periods.update({path: v for path, v in saved.items() if path in DEFAULT_PERIODS and valid_period(v)})
+    if not isinstance(saved, dict):
+        return
+    if isinstance(polls := saved.get("poll_periods"), dict):
+        periods.update({path: v for path, v in polls.items() if path in DEFAULT_PERIODS and valid_period(v)})
+    if isinstance(saved.get("auto_record"), bool):
+        auto_record = saved["auto_record"]
+
+
+def save_settings(poll_periods: dict, auto: bool) -> str | None:
+    """Returns an error, if any. A power cut leaves the old settings or the new ones, never half."""
+    changed = {path: v for path, v in poll_periods.items() if v != DEFAULT_PERIODS[path]}
+    temporary = SETTINGS.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps({"auto_record": auto, "poll_periods": changed}, indent=2))
+        temporary.replace(SETTINGS)
+    except OSError as error:
+        return f"could not save the settings: {error}"
+    return None
+
+
+def set_auto_record(value) -> str | None:
+    """Only for the next start of the logger: what is recording now goes on, or stays stopped."""
+    global auto_record
+    if not isinstance(value, bool):
+        return "auto_record must be true or false"
+    if error := save_settings(periods, value):
+        return error
+    auto_record = value
+    rec.event(f"automatic recording {'enabled' if value else 'disabled'} for the next starts")
+    return None
 
 
 def apply_periods(new) -> str | None:
@@ -143,14 +174,10 @@ def apply_periods(new) -> str | None:
         if not valid_period(value):
             return f"the period of {path} must be a number of seconds from {MIN_PERIOD} to {MAX_PERIOD}"
     merged = {**periods, **new}
-    changed = {path: v for path, v in merged.items() if v != DEFAULT_PERIODS[path]}
-    temporary = SETTINGS.with_suffix(".tmp")
-    try:
-        temporary.write_text(json.dumps({"poll_periods": changed}, indent=2))
-        temporary.replace(SETTINGS)  # a power cut leaves the old settings or the new ones, never half
-    except OSError as error:  # nothing changes, so the current file's poll_periods_s stays true
-        return f"could not save the settings: {error}"
+    if error := save_settings(merged, auto_record):  # nothing changes, so the current file's poll_periods_s stays true
+        return error
     periods.update(new)
+    changed = {path: v for path, v in merged.items() if v != DEFAULT_PERIODS[path]}
     rec.event(f"poll periods changed: {json.dumps(changed)}")
     if rec.stopped:  # the next file, when recording starts again, uses them
         return None
@@ -220,7 +247,7 @@ class Recorder:
     """The one place that writes to the file. It never raises: a failure is shown on the page and recorded, and
     recording goes on as soon as the disk lets it."""
 
-    def __init__(self, clock: Clock):
+    def __init__(self, clock: Clock, record: bool = True):
         self.clock = clock
         self.generation = 0  # bumped with every new file and resume, so sources that write on change write again
         # Reentrant, because start() writes. The container log threads write directly, so a backlog can't starve the
@@ -234,6 +261,12 @@ class Recorder:
         self.errors: dict[str, str] = {}  # what is failing, shown on the page
         self.links: dict[str, str] = {}
         self.seen: dict[str, float] = {}  # monotonic time of the last message from each websocket
+        if not record:  # automatic recording is off: stopped until Start, and no empty file meanwhile
+            self.path, self.file, self.writer = LOG_DIR / "none", None, None
+            self.closed = self.stopped = True
+            self.dropped_at_stop = 0
+            self._reset()
+            return
         try:
             self.path, self.file, self.writer = self._new_file()
         except Exception as error:  # a read-only card, say: the page says so, and watch_disk keeps trying
@@ -334,7 +367,7 @@ class Recorder:
 
     def stop(self) -> None:
         """The emergency stop on the page: the file is finished whole and nothing more is written, not even to a new
-        file, until restart(). Not kept across restarts of the logger, so a reboot never leaves a run unrecorded."""
+        file, until restart(). Not kept across restarts of the logger: those follow auto_record."""
         with self.lock:
             if self.closed:
                 raise RuntimeError("not recording")
@@ -424,7 +457,7 @@ class Recorder:
         """Writes the chunk in memory out. Returns the file descriptor to fsync, outside the lock: on a slow card
         that can take a while, and the event loop writes under this lock."""
         with self.lock:
-            if self.write_error or self.file.closed:
+            if self.write_error or self.file is None or self.file.closed:
                 return None
             try:
                 self.writer.flush()
@@ -1176,6 +1209,7 @@ def status() -> dict:
         "topics": len(rec.channels),
         "paused": rec.paused,
         "stopped": rec.stopped,
+        "auto_record": auto_record,
         "write_error": rec.write_error,
         "dropped": rec.dropped,
         "links": rec.links,
@@ -1223,7 +1257,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/register_service":
             self.reply_json(200, REGISTER_SERVICE)
         elif path == "/settings":
-            self.reply_json(200, {"min": MIN_PERIOD, "max": MAX_PERIOD, "polls": [
+            self.reply_json(200, {"min": MIN_PERIOD, "max": MAX_PERIOD, "auto_record": auto_record, "polls": [
                 {"path": p, "period": periods[p], "default": d, "always": a} for p, d, a in POLLS]})
         elif path == "/status":
             self.reply_json(200, status())
@@ -1289,7 +1323,10 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length)) if 0 < length <= 2**16 else None
             except ValueError:
                 body = None
-            error = apply_periods(body.get("poll_periods") if isinstance(body, dict) else None)
+            if isinstance(body, dict) and "auto_record" in body and "poll_periods" not in body:
+                error = set_auto_record(body["auto_record"])
+            else:
+                error = apply_periods(body.get("poll_periods") if isinstance(body, dict) else None)
             self.reply_json(400 if error else 200, {"error": error, "file": rec.path.name})
         elif path == "/new_file":
             try:
@@ -1323,11 +1360,13 @@ async def main() -> None:
     # log scan) in asyncio's default pool of cpus + 4 threads.
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(len(POLLS) + 8))
     load_settings()
-    rec = Recorder(clock)
-    rec.start()
+    rec = Recorder(clock, record=auto_record)
+    if auto_record:
+        rec.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
-    print(f"Recording to {rec.path}, web interface on port {PORT}", flush=True)
+    print(f"Recording to {rec.path}" if auto_record else "Automatic recording is off, waiting for Start",
+          f"web interface on port {PORT}", sep=", ", flush=True)
 
     sources = {f"poll {path}": (lambda p=path, a=always: poll(p, a)) for path, _, always in POLLS}
     sources["mavlink2rest"] = lambda: websocket("mavlink2rest", "/mavlink2rest/ws/mavlink?filter=.*", handle_mavlink)

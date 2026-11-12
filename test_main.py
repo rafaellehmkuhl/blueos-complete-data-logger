@@ -176,7 +176,7 @@ def test_poll_periods() -> None:
     assert main.periods[CPU] == 1 and main.rec.path == before
     assert main.apply_periods({CPU: 0.5}) is None
     assert main.periods[CPU] == 0.5 and main.rec.path != before
-    assert json.loads(main.SETTINGS.read_text()) == {"poll_periods": {CPU: 0.5}}
+    assert json.loads(main.SETTINGS.read_text()) == {"auto_record": True, "poll_periods": {CPU: 0.5}}
     main.periods[CPU] = 1
     main.load_settings()
     assert main.periods[CPU] == 0.5
@@ -313,6 +313,44 @@ def test_stopping() -> None:
     except RuntimeError:
         pass
     assert set(main.LOG_DIR.glob("*.mcap")) == files
+
+
+def test_auto_record_off() -> None:
+    """With automatic recording off, the logger starts stopped and creates no file until Start. The setting is saved
+    with the rates, and a broken settings file falls back to recording."""
+    main.rec.finish()
+    files = set(main.LOG_DIR.glob("*.mcap"))
+    main.rec = main.Recorder(main.clock, record=False)
+    main.rec.write("/a", {"v": 1})
+    assert main.rec.stopped and main.rec.flush() is None and main.status()["file"] == "none"
+    assert set(main.LOG_DIR.glob("*.mcap")) == files, "no file until Start"
+    main.rec.restart()
+    main.rec.write("/a", {"v": 2})
+    main.rec.finish()
+    assert [e["data"]["v"] for e in topic(messages(main.rec.path.read_bytes()), "/a")] == [2]
+
+    fresh()
+    saved = main.SETTINGS.read_text() if main.SETTINGS.exists() else None
+    try:
+        assert main.set_auto_record("no") and main.auto_record
+        assert main.set_auto_record(False) is None and not main.auto_record
+        main.auto_record = True
+        main.load_settings()
+        assert main.auto_record is False, "survives restarts"
+        assert main.apply_periods({CPU: 2}) is None
+        main.load_settings()
+        assert main.auto_record is False and main.periods[CPU] == 2, "saving the rates keeps it"
+        main.SETTINGS.write_text("[1]")
+        main.auto_record = True
+        main.load_settings()
+        assert main.auto_record
+    finally:
+        main.auto_record = True
+        main.periods[CPU] = main.DEFAULT_PERIODS[CPU]
+        main.SETTINGS.unlink(missing_ok=True)
+        if saved is not None:
+            main.SETTINGS.write_text(saved)
+        main.rec.finish()
 
 
 def test_stop_and_start() -> None:
@@ -820,6 +858,11 @@ def test_http() -> None:
         assert call("/settings", "POST", json.dumps({"poll_periods": {CPU: 0.5}}).encode(), "text/plain")[0] == 415
         assert main.periods[CPU] == 1
         assert call("/settings", "POST", b'{"poll_periods": {"/nope": 1}}')[0] == 400
+        assert call("/settings", "POST", b'{"auto_record": 1}')[0] == 400
+        code, body = call("/settings", "POST", b'{"auto_record": false}')
+        assert code == 200 and not json.loads(call("/settings")[1])["auto_record"]
+        assert not json.loads(call("/status")[1])["auto_record"]
+        assert call("/settings", "POST", b'{"auto_record": true}')[0] == 200 and main.auto_record
         code, body = call("/new_file", "POST", b"{}")
         assert code == 200 and json.loads(body)["finished"] == active
         assert call(f"/delete/{active}", "POST", b"{}")[0] == 204 and not (main.LOG_DIR / active).exists()
