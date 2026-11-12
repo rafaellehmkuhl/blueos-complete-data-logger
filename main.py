@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BlueOS Complete Data Logger.
+"""Powerful and Unofficial Single File Logger for BlueOS.
 
 Records MAVLink, BlueOS service state, kernel messages, BlueOS service logs and container logs into one MCAP file
 per run. Every message is wrapped as:
@@ -690,7 +690,7 @@ async def supervise(name: str, run) -> None:
 
 
 REGISTER_SERVICE = {
-    "name": "Complete Data Logger",
+    "name": "Powerful and Unofficial Single File Logger for BlueOS",
     "description": "Records MAVLink, BlueOS services, kernel and service logs into one MCAP file",
     "icon": "mdi-database-clock",
     "company": "Blue Robotics",

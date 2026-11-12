@@ -1,4 +1,4 @@
-"""Logs into the Complete Data Logger from another service or extension.
+"""Logs into the Powerful and Unofficial Single File Logger for BlueOS from another service or extension.
 
 Usage: python example_client.py [ws://blueos.local:9651]
 """

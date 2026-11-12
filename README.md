@@ -1,4 +1,4 @@
-# BlueOS Complete Data Logger
+# Powerful and Unofficial Single File Logger for BlueOS
 
 A BlueOS extension that records everything the vehicle knows about itself into one [MCAP](https://mcap.dev) file per run: all MAVLink traffic, the state of every BlueOS service, kernel messages, the BlueOS service logs and the logs of every container, extensions included. Open the file in [Foxglove](https://foxglove.dev) or read it with any MCAP library.
 
