@@ -433,6 +433,9 @@
          data-tip="&lt;strong&gt;Connecting&lt;/strong&gt;Waiting for the logger to answer.">
       <span class="rec-dot" aria-hidden="true"></span><span id="state-text">CONNECTING</span>
     </div>
+    <a class="btn" href="player" id="open-player"
+       data-tip="&lt;strong&gt;Open the player&lt;/strong&gt;Replay a recording from this vehicle or from your computer: every message, the logs and plots of any value, on one timeline.">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/></svg>Player</a>
     <button class="btn icon-btn" type="button" id="open-settings" aria-label="Settings" aria-haspopup="dialog"
             data-tip="&lt;strong&gt;Settings&lt;/strong&gt;How often each BlueOS service is polled.">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -610,6 +613,7 @@ const icons = {
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
   warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 8v5m0 3.5h.01"/><circle cx="12" cy="12" r="9"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>',
   chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
 };
 const TIPS = {
@@ -617,6 +621,8 @@ const TIPS = {
   raw: "<strong>Without the time correction</strong>The file exactly as it was written. Each message keeps the absolute time the vehicle believed at that moment, so messages from before the clock was synchronized keep that earlier, possibly wrong, time: the correction is not applied back to them. Relative timing is the same as in Download. Useful to investigate the clock itself, and faster, since nothing is reprocessed on the vehicle.",
   live: "Still being written. Downloads include everything up to the last few seconds, which are written to the card every 5 seconds.",
   done: "Finished: the logger closed this file cleanly.",
+  play: "<strong>Open in the player</strong>Replay it in this browser: every message, the logs and plots of any value.",
+  playLive: "<strong>Open in the player</strong>Replays what was recorded until now. The file keeps growing here: open it again to see more.",
 };
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 const fmt = new Intl.NumberFormat();
@@ -821,6 +827,8 @@ function renderRecordings(list, now) {
             <span class="num" data-size></span><span aria-hidden="true">·</span><span class="rec-name">${esc(r.name)}</span></div>
         </div>
         <div class="actions">
+          <a class="btn" href="player#file=${enc}" data-tip="${esc(r.active ? TIPS.playLive : TIPS.play)}"
+             aria-label="Play ${esc(r.name)}">${icons.play}Play</a>
           <span class="split">
             <a class="btn primary" href="download/${enc}" data-tip="${esc(TIPS.download)}">${icons.down}Download</a>
             <button class="btn primary more" type="button" data-more="${enc}" aria-haspopup="menu" aria-expanded="false"

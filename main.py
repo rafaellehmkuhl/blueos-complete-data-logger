@@ -1311,6 +1311,7 @@ def status() -> dict:
 
 
 PAGE = (Path(__file__).parent / "index.html").read_bytes()
+PLAYER = (Path(__file__).parent / "player.html").read_bytes()
 # A corrected download re-encodes every message in this process, so one at a time keeps a core for recording.
 exporting = BoundedSemaphore(1)
 
@@ -1391,6 +1392,8 @@ class Handler(BaseHTTPRequestHandler):
                     size -= len(chunk)
         elif path == "/":
             self.reply(200, PAGE, "text/html; charset=utf-8")
+        elif path == "/player":
+            self.reply(200, PLAYER, "text/html; charset=utf-8")
         else:
             self.reply(404, b"Not found", "text/plain")
 

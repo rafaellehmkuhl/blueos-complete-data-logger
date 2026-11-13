@@ -56,6 +56,6 @@ ENV VERSION=${VERSION}
 LABEL version="${VERSION}"
 LABEL readme="https://raw.githubusercontent.com/rafaellehmkuhl/blueos-complete-data-logger/${VERSION}/README.md"
 
-COPY main.py index.html ./
+COPY main.py index.html player.html ./
 
 CMD ["python", "-u", "main.py"]

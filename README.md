@@ -92,6 +92,19 @@ It is saved at once and applies from the next start, arm or disarm: a recording 
 
 **Polling rates**, also in the settings, sets how often each BlueOS service is asked for its state. Edit as many as you like; nothing changes until you press **Apply**, which saves them (they survive restarts) and starts a new file, so every file has one set of rates, recorded in its `poll_periods_s` metadata. Going faster than the default makes the file bigger and can be more than a service keeps up with, so the page warns about it: test before relying on it. Endpoints written only on change cost almost nothing to poll often; the ones written at every poll grow the file with every poll. Also available as `GET /settings` and `POST /settings` with `{"poll_periods": {"<path>": <seconds>}}`. Files live in `/usr/blueos/extensions/complete-data-logger` on the vehicle and are numbered, so their order holds even when the clock that named them was wrong. The list shows each one's number, start, end and duration in your time zone, in the best time known for the file: once the vehicle's clock is synchronized, files recorded earlier in the same boot show the corrected time too. Times in orange are approximate, from the vehicle's own clock only. `GET /status` lists the same under `recordings`.
 
+### Player
+
+**Player**, at the top of the page, or **Play** on any recording, opens a recording in its own screen. Recordings from the vehicle open from its list; any MCAP file on your computer opens by dropping it on the page or choosing it, including the ones downloaded from here. It is read in the browser, nothing is uploaded, and it works with no internet on the vehicle.
+
+- **Timeline**: play, pause, speeds from 0.5× to 1800×, and a bar showing how many messages there are over time, when the vehicle was armed (red underline) and logger events (yellow ticks). Space plays and pauses, arrows move 1 s (10 s with Shift), `,` and `.` go to the previous and next message of the selected topic.
+- **Topics**, grouped by source, each with its message count and a dot that lights up when it has just received a message.
+- **Message**: the selected topic's last message at the playhead, as a tree. Values that changed since the previous message flash.
+- **Logs**: service logs, container logs, kernel messages and logger events up to the playhead, searchable and filtered by level and source. Clicking a line moves the playhead there.
+- **Plots**: any number in a message plots over the whole recording, each in its own row, with the playhead on all of them. Drag across a plot to zoom in, click to move the playhead.
+- **Vehicle**: armed state, battery, heading, altitude, speed, roll and pitch from the autopilot, when the file has them.
+
+Times are shown in your time zone, with the best time reference of the run applied, like Download does. The first plot of a recording reads the whole file once for every MAVLink topic, so plotting more of them is instant afterwards. That read takes seconds for a 30-minute recording, longer for recordings of many hours.
+
 Recording pauses while the disk is over 95% full or has less than 1 GB free, so the vehicle never runs out of space, and resumes on its own. The page shows how fast the file grows and, at that rate, how long until the disk reaches the limit. An hour takes roughly 50 MB.
 
 If the vehicle loses power, the file has no index and the last few seconds are lost: what is in memory is written and synced to the card every 5 seconds. Download still works on such a file, and `mcap recover <file>` rebuilds its index for other tools.

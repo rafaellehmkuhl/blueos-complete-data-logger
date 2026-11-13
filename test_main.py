@@ -890,6 +890,8 @@ def test_http() -> None:
                     "mavlink_gaps", "failing_endpoints", "time", "version", "disk", "recordings", "recording_mode", "armed", "stops_in_s"):
             assert key in status, key  # what index.html reads
         assert call("/")[0] == 200 and call("/settings")[0] == 200
+        code, body = call("/player")
+        assert code == 200 and b"fzstd" in body, "the player page, with its zstd reader inside so it works offline"
         assert call("/download/..%2Fsettings.json")[0] == 404
         assert call("/raw/../../etc/passwd")[0] == 404
         active = main.rec.path.name

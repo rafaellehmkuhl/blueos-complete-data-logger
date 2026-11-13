@@ -1,0 +1,1331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Single File Logger Player</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f6fa;
+    --surface: #ffffff;
+    --surface-2: #eef2f7;
+    --border: #dbe2ec;
+    --text: #0f1b2d;
+    --muted: #5b6b82;
+    --accent: #1572d6;
+    --accent-soft: #1572d61a;
+    --rec: #e5383b;
+    --rec-soft: #e5383b1f;
+    --ok: #12945a;
+    --ok-soft: #12945a1c;
+    --warn: #c27a00;
+    --warn-soft: #c27a001f;
+    --shadow: 0 1px 2px #0f1b2d0d, 0 8px 24px #0f1b2d10;
+    --radius: 14px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #0d1520;
+      --surface: #142030;
+      --surface-2: #1b2a3d;
+      --border: #24364d;
+      --text: #e7eef8;
+      --muted: #8da0b8;
+      --accent: #4ea3ff;
+      --accent-soft: #4ea3ff1f;
+      --rec: #ff5a5f;
+      --rec-soft: #ff5a5f24;
+      --ok: #3fd48c;
+      --ok-soft: #3fd48c1f;
+      --warn: #ffb547;
+      --warn-soft: #ffb54722;
+      --shadow: 0 1px 2px #0005, 0 10px 30px #0006;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  [hidden] { display: none !important; }
+
+  .app { display: flex; flex-direction: column; height: 100%; }
+  .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .bar h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -0.01em; }
+  .file-info { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; min-width: 0; font-size: 13px; color: var(--muted); }
+  .file-info strong { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+  .bar .spacer { margin-inline-start: auto; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.yes { background: var(--ok-soft); color: var(--ok); }
+  .badge.no { background: var(--warn-soft); color: var(--warn); }
+  .badge.live { background: var(--rec-soft); color: var(--rec); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 14px; border-radius: 9px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    font: 600 13px/1 system-ui, sans-serif; text-decoration: none; cursor: pointer; white-space: nowrap;
+    transition: background .2s, border-color .2s, color .2s, transform .1s;
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn svg { width: 15px; height: 15px; flex: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
+  .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .btn.ghost:hover { color: var(--text); background: var(--surface-2); }
+  .btn.icon { padding: 7px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; }
+  .card h2 {
+    display: flex; align-items: center; gap: 8px; margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  input[type="search"], select {
+    padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    font: 13px system-ui, sans-serif; min-width: 0;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+  /* Choosing a file */
+  .pick-view { flex: 1; overflow: auto; padding: 24px 16px 48px; }
+  .pick-inner { max-width: 820px; margin: 0 auto; display: grid; gap: 16px; }
+  .drop {
+    display: grid; justify-items: center; gap: 10px; padding: 40px 24px; text-align: center;
+    border: 2px dashed var(--border); border-radius: var(--radius); background: var(--surface);
+    transition: border-color .2s, background .2s; animation: rise .4s cubic-bezier(.2, .8, .2, 1) both;
+  }
+  .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop svg.big { width: 44px; height: 44px; color: var(--accent); }
+  .drop h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; text-transform: none; color: var(--text); }
+  .drop p { margin: 0; color: var(--muted); font-size: 14px; max-width: 52ch; text-wrap: pretty; }
+  .vehicle-files { padding: 18px 20px; animation: rise .4s .06s cubic-bezier(.2, .8, .2, 1) both; }
+  .vehicle-files ul { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+  .vf { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .vf .meta { flex: 1; min-width: 0; }
+  .vf .when { font-weight: 600; }
+  .vf .sub { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .vf .n { font: 600 13px var(--mono); color: var(--muted); }
+  .note { color: var(--muted); font-size: 14px; padding: 8px 0; }
+
+  /* Loading */
+  .loading-view { flex: 1; display: grid; place-items: center; padding: 24px 16px; }
+  .loading { width: min(480px, 100%); padding: 24px; display: grid; gap: 12px; }
+  .loading .title { font-weight: 650; font-size: 16px; overflow-wrap: anywhere; }
+  .progress { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .2s; }
+  .loading .detail { font-size: 13px; color: var(--muted); }
+  .loading.bad .title { color: var(--rec); }
+  .loading.bad .progress { display: none; }
+
+  /* Playing */
+  .play-view { flex: 1; min-height: 0; display: grid; grid-template-columns: 290px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+  .topics { grid-row: 1; margin: 12px 0 12px 12px; display: flex; flex-direction: column; overflow: hidden; }
+  .topics-head { padding: 12px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; }
+  .topics-list { overflow: auto; padding: 6px; flex: 1; }
+  .group > summary {
+    display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: pointer; list-style: none; border-radius: 8px;
+    font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  }
+  .group > summary::-webkit-details-marker { display: none; }
+  .group > summary::before { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg); transition: transform .15s; }
+  .group[open] > summary::before { transform: rotate(45deg); }
+  .group > summary:hover { background: var(--surface-2); }
+  .group > summary .c { margin-inline-start: auto; font-weight: 500; letter-spacing: 0; }
+  .topic {
+    display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 8px 5px 22px; border: 0; border-radius: 7px;
+    background: none; color: var(--text); font: 13px system-ui, sans-serif; text-align: start; cursor: pointer;
+  }
+  .topic:hover { background: var(--surface-2); }
+  .topic[aria-current="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .topic .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topic .count { font-size: 12px; color: var(--muted); }
+  .topic .dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--border); transition: background .3s; }
+  .topic .dot.fresh { background: var(--ok); transition: none; }
+
+  .panes { grid-row: 1; overflow: auto; padding: 12px; display: grid; gap: 12px; align-content: start;
+           grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .panes > .wide { grid-column: 1 / -1; }
+  .pane { display: flex; flex-direction: column; }
+  .pane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .pane-head .sub { font-size: 13px; color: var(--muted); }
+  .pane-head .end { margin-inline-start: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+  .vehicle { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+  .tile { padding: 10px 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); }
+  .tile .label { font-size: 12px; color: var(--muted); }
+  .tile .value { display: block; font: 600 18px/1.3 var(--mono); letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile.armed { background: var(--rec-soft); border-color: transparent; }
+  .tile.armed .value { color: var(--rec); }
+  .tile.stale .value { color: var(--muted); }
+
+  .inspector .pane-head h2, .logs .pane-head h2 { min-width: 0; }
+  .card h2.topic-title { font: 600 14px var(--mono); color: var(--text); overflow-wrap: anywhere; letter-spacing: 0; text-transform: none; }
+  .tree { padding: 10px 14px 14px; height: clamp(220px, 36vh, 420px); overflow: auto; font: 13px/1.6 var(--mono); resize: vertical; }
+  .tree .row { display: flex; align-items: baseline; gap: 6px; padding-inline-start: calc(var(--d) * 16px); border-radius: 5px; }
+  .tree .row:hover { background: var(--surface-2); }
+  .tree .k { color: var(--muted); }
+  .tree .v { overflow-wrap: anywhere; min-width: 0; }
+  .tree .v.n { color: var(--accent); }
+  .tree .v.s { color: var(--ok); }
+  .tree .v.b { color: var(--warn); }
+  .tree .v.z { color: var(--muted); }
+  .tree .tog { all: unset; cursor: pointer; display: inline-flex; gap: 6px; align-items: baseline; }
+  .tree .tog::before { content: "▸"; display: inline-block; width: 10px; color: var(--muted); transition: transform .15s; }
+  .tree .tog[aria-expanded="true"]::before { transform: rotate(90deg); }
+  .tree .tog:focus-visible { outline: 2px solid var(--accent); border-radius: 4px; }
+  .tree .sum { color: var(--muted); font-size: 12px; }
+  .tree .plot {
+    all: unset; cursor: pointer; margin-inline-start: auto; padding: 0 7px; border-radius: 6px; font: 600 12px/1.6 system-ui, sans-serif;
+    color: var(--accent); opacity: 0; flex: none;
+  }
+  .tree .row:hover .plot, .tree .plot:focus-visible { opacity: 1; background: var(--accent-soft); }
+  .tree .plot.on { opacity: 1; }
+  .tree .more { all: unset; cursor: pointer; color: var(--accent); font-size: 12px; padding-inline-start: calc(var(--d) * 16px + 16px); }
+  .tree .chg .v { animation: chg 1s ease-out; }
+  @keyframes chg { from { background: var(--warn-soft); } }
+  .tree .empty { color: var(--muted); font-family: system-ui, sans-serif; padding: 12px 0; }
+
+  .log-list { height: clamp(220px, 36vh, 420px); overflow: auto; padding: 6px 0; font: 12.5px/1.5 var(--mono); resize: vertical; }
+  .log { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 10px; padding: 1px 14px; cursor: pointer; }
+  .log:hover { background: var(--surface-2); }
+  .log .t { color: var(--muted); }
+  .log .src { color: var(--accent); max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .log.error { background: var(--rec-soft); } .log.error .txt { color: var(--rec); }
+  .log.warn .txt { color: var(--warn); }
+  .log.debug .txt { color: var(--muted); }
+  .log.now { box-shadow: inset 3px 0 var(--accent); }
+  .log-list .empty { color: var(--muted); padding: 12px 14px; font-family: system-ui, sans-serif; }
+
+  .plots-body { padding: 4px 14px 14px; display: grid; gap: 10px; }
+  .plots-body .empty { color: var(--muted); font-size: 14px; padding: 10px 0; }
+  .plot-row { position: relative; }
+  .plot-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .plot-head .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .plot-head .name { font: 12.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .plot-head .val { margin-inline-start: auto; font: 600 13px var(--mono); }
+  .plot-head .btn { padding: 3px; }
+  .plot-head .btn svg { width: 13px; height: 13px; }
+  .plot-area { position: relative; height: 110px; margin-top: 4px; border-radius: 8px; background: var(--surface-2); cursor: crosshair; touch-action: none; }
+  .plot-area canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .plot-area .cursor { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--rec); pointer-events: none; }
+  .plot-area .hover { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--muted); pointer-events: none; opacity: .6; }
+  .plot-area .sel { position: absolute; top: 0; bottom: 0; background: var(--accent-soft); border: 1px solid var(--accent); pointer-events: none; }
+  .plot-area .status { position: absolute; inset: 0; display: grid; place-items: center; font-size: 13px; color: var(--muted); }
+  .plot-tip {
+    position: fixed; z-index: 10; padding: 6px 10px; border-radius: 8px; background: var(--text); color: var(--bg);
+    font: 12px/1.4 var(--mono); pointer-events: none; white-space: nowrap; box-shadow: var(--shadow);
+  }
+
+  .transport {
+    grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px;
+    border-top: 1px solid var(--border); background: var(--surface);
+  }
+  .transport .btn.play { width: 42px; height: 42px; padding: 0; border-radius: 50%; }
+  .transport .btn.play svg { width: 18px; height: 18px; }
+  .clock { display: grid; line-height: 1.2; min-width: 15ch; }
+  .clock .abs { font: 600 16px var(--mono); }
+  .clock .rel { font: 12px var(--mono); color: var(--muted); }
+  .scrub { position: relative; flex: 1 1 320px; height: 44px; border-radius: 8px; background: var(--surface-2); cursor: pointer; touch-action: none; }
+  .scrub canvas { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: inherit; }
+  .scrub .zoom { position: absolute; top: 0; bottom: 0; background: var(--accent-soft); border-inline: 1px solid var(--accent); pointer-events: none; }
+  .scrub .head { position: absolute; top: -3px; bottom: -3px; width: 3px; margin-left: -1.5px; border-radius: 2px; background: var(--rec); pointer-events: none; }
+  .scrub .head::after { content: ""; position: absolute; top: -5px; left: 50%; width: 11px; height: 11px; margin-left: -5.5px; border-radius: 50%; background: var(--rec); }
+  .scrub:focus-visible { outline-offset: 3px; }
+
+  .drop-overlay {
+    position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 80%, transparent);
+    backdrop-filter: blur(3px); font-size: 22px; font-weight: 650; color: var(--accent); opacity: 0; pointer-events: none; transition: opacity .15s;
+  }
+  .drop-overlay.show { opacity: 1; }
+  .drop-overlay div { padding: 40px 60px; border: 2px dashed var(--accent); border-radius: var(--radius); background: var(--surface); }
+
+  @media (max-width: 900px) {
+    .play-view { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
+    .topics { grid-row: 1; margin: 12px 12px 0; max-height: 32vh; }
+    .panes { grid-row: 2; grid-template-columns: minmax(0, 1fr); }
+    .transport { grid-row: 3; }
+    .tree, .log-list { height: 320px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <a class="btn ghost" href="./" title="Back to the logger">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>Logger</a>
+    <h1>Player</h1>
+    <div class="file-info" id="file-info"></div>
+    <span class="spacer"></span>
+    <button class="btn" type="button" id="open-another" hidden>Open another file</button>
+  </header>
+
+  <section class="pick-view" id="pick">
+    <div class="pick-inner">
+      <div class="drop" id="drop">
+        <svg class="big" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/></svg>
+        <h2>Drop an MCAP file here</h2>
+        <p>Or pick one from this computer, or from this vehicle below. The file is read in this browser: nothing is uploaded.</p>
+        <label class="btn primary">Choose file<input type="file" id="file-input" accept=".mcap" hidden></label>
+      </div>
+      <div class="card vehicle-files">
+        <h2>On this vehicle</h2>
+        <ul id="vehicle-list"><li class="note">Looking for recordings…</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="loading-view" id="loading" hidden>
+    <div class="card loading" id="loading-card" role="status" aria-live="polite">
+      <div class="title" id="load-title"></div>
+      <div class="progress"><div id="load-bar"></div></div>
+      <div class="detail num" id="load-detail"></div>
+      <div><button class="btn" type="button" id="load-cancel">Cancel</button></div>
+    </div>
+  </section>
+
+  <section class="play-view" id="play" hidden>
+    <aside class="card topics" aria-label="Topics">
+      <div class="topics-head">
+        <input type="search" id="topic-filter" placeholder="Filter topics" aria-label="Filter topics">
+      </div>
+      <div class="topics-list" id="topics"></div>
+    </aside>
+
+    <div class="panes">
+      <div class="vehicle wide" id="vehicle" hidden></div>
+
+      <div class="card pane inspector">
+        <div class="pane-head">
+          <h2 id="insp-title" class="topic-title">Message</h2>
+          <div class="end">
+            <span class="sub num" id="insp-meta"></span>
+            <button class="btn icon" type="button" id="insp-prev" title="Previous message of this topic (,)" aria-label="Previous message">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+            <button class="btn icon" type="button" id="insp-next" title="Next message of this topic (.)" aria-label="Next message">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+          </div>
+        </div>
+        <div class="tree" id="tree"></div>
+      </div>
+
+      <div class="card pane logs">
+        <div class="pane-head">
+          <h2>Logs</h2>
+          <div class="end">
+            <input type="search" id="log-text" placeholder="Search" aria-label="Search logs" size="12">
+            <select id="log-level" aria-label="Log level">
+              <option value="all">All levels</option>
+              <option value="warn">Warnings and errors</option>
+              <option value="error">Errors</option>
+            </select>
+            <select id="log-src" aria-label="Log source"><option value="">All sources</option></select>
+          </div>
+        </div>
+        <div class="log-list" id="logs"></div>
+      </div>
+
+      <div class="card pane plots wide">
+        <div class="pane-head">
+          <h2>Plots</h2>
+          <span class="sub">Drag across a plot to zoom in, double-click to zoom out.</span>
+          <div class="end"><button class="btn" type="button" id="zoom-reset" hidden>Show whole recording</button></div>
+        </div>
+        <div class="plots-body" id="plots"></div>
+      </div>
+    </div>
+
+    <footer class="transport">
+      <button class="btn icon" type="button" id="back10" title="Back 10 s (Shift+←)" aria-label="Back 10 seconds">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg></button>
+      <button class="btn primary play" type="button" id="play-btn" title="Play (Space)" aria-label="Play"></button>
+      <button class="btn icon" type="button" id="fwd10" title="Forward 10 s (Shift+→)" aria-label="Forward 10 seconds">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 17l5-5-5-5M6 17l5-5-5-5"/></svg></button>
+      <div class="clock">
+        <span class="abs num" id="t-abs">–</span>
+        <span class="rel num" id="t-rel">–</span>
+      </div>
+      <div class="scrub" id="scrub" tabindex="0" role="slider" aria-label="Position in the recording" aria-valuemin="0">
+        <canvas id="scrub-canvas"></canvas>
+        <div class="zoom" id="scrub-zoom" hidden></div>
+        <div class="head" id="scrub-head"></div>
+      </div>
+      <select id="speed" aria-label="Playback speed" title="Playback speed">
+        <option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option>
+        <option value="5">5×</option><option value="10">10×</option><option value="30">30×</option>
+        <option value="60">60×</option><option value="300">300×</option><option value="1800">1800×</option>
+      </select>
+    </footer>
+  </section>
+</div>
+<div class="drop-overlay" id="drop-overlay" aria-hidden="true"><div>Drop to open</div></div>
+<div class="plot-tip" id="plot-tip" hidden></div>
+
+<!-- The reader runs in a worker so a large file never freezes the page. It is plain text here and started from a Blob,
+     so the page stays one file and works on a vehicle with no internet. -->
+<script type="text/plain" id="worker-src">
+/*! fzstd 0.1.1 (zstd decompressor), MIT License, Copyright (c) 2020 Arjun Barrett */
+!function(f){typeof module!='undefined'&&typeof exports=='object'?module.exports=f():typeof define!='undefined'&&define.amd?define(['fzstd',f]):(typeof self!='undefined'?self:this).fzstd=f()}(function(){var _e={};"use strict";var r=ArrayBuffer,t=Uint8Array,e=Uint16Array,n=Int16Array,a=Uint32Array,s=Int32Array,i=function(r,e,n){if(t.prototype.slice)return t.prototype.slice.call(r,e,n);(null==e||e<0)&&(e=0),(null==n||n>r.length)&&(n=r.length);var a=new t(n-e);return a.set(r.subarray(e,n)),a},o=function(r,e,n,a){if(t.prototype.fill)return t.prototype.fill.call(r,e,n,a);for((null==n||n<0)&&(n=0),(null==a||a>r.length)&&(a=r.length);n<a;++n)r[n]=e;return r},u=function(r,e,n,a){if(t.prototype.copyWithin)return t.prototype.copyWithin.call(r,e,n,a);for((null==n||n<0)&&(n=0),(null==a||a>r.length)&&(a=r.length);n<a;)r[e++]=r[n++]};_e.ZstdErrorCode={InvalidData:0,WindowSizeTooLarge:1,InvalidBlockType:2,FSEAccuracyTooHigh:3,DistanceTooFarBack:4,UnexpectedEOF:5};var h=["invalid zstd data","window size too large (>2046MB)","invalid block type","FSE accuracy too high","match distance too far back","unexpected EOF"],f=function(r,t,e){var n=Error(t||h[r]);if(n.code=r,Error.captureStackTrace&&Error.captureStackTrace(n,f),!e)throw n;return n},l=function(r,t,e){for(var n=0,a=0;n<e;++n)a|=r[t++]<<(n<<3);return a},v=function(r,t){return(r[t]|r[t+1]<<8|r[t+2]<<16|r[t+3]<<24)>>>0},c=function(r,e){var n=r[0]|r[1]<<8|r[2]<<16;if(3126568==n&&253==r[3]){var a=r[4],i=a>>5&1,o=a>>2&1,u=3&a,h=a>>6;8&a&&f(0);var c=6-i,b=3==u?4:u,y=l(r,c,b),p=h?1<<h:i,w=l(r,c+=b,p)+(1==h&&256),g=w;if(!i){var d=1<<10+(r[5]>>3);g=d+(d>>3)*(7&r[5])}g>2145386496&&f(1);var m=new t((1==e?w||g:e?0:g)+12);return m[0]=1,m[4]=4,m[8]=8,{b:c+p,y:0,l:0,d:y,w:e&&1!=e?e:m.subarray(12),e:g,o:new s(m.buffer,0,3),u:w,c:o,m:Math.min(131072,g)}}if(25481893==(n>>4|r[3]<<20))return v(r,4)+8;f(0)},b=function(r){for(var t=0;1<<t<=r;++t);return t-1},y=function(a,s,i){var o=4+(s<<3),u=5+(15&a[s]);u>i&&f(3);for(var h=1<<u,l=h,v=-1,c=-1,y=-1,p=h,w=new r(512+(h<<2)),g=new n(w,0,256),d=new e(w,0,256),m=new e(w,512,h),z=512+(h<<1),E=new t(w,z,h),k=new t(w,z+h);v<255&&l>0;){var A=b(l+1),T=o>>3,x=(1<<A+1)-1,F=(a[T]|a[T+1]<<8|a[T+2]<<16)>>(7&o)&x,S=(1<<A)-1,B=x-l-1,I=F&S;if(I<B?(o+=A,F=I):(o+=A+1,F>S&&(F-=B)),g[++v]=--F,-1==F?(l+=F,E[--p]=v):l-=F,!F)do{var U=o>>3;c=(a[U]|a[U+1]<<8)>>(7&o)&3,o+=2,v+=c}while(3==c)}(v>255||l)&&f(0);for(var D=0,M=(h>>1)+(h>>3)+3,W=h-1,O=0;O<=v;++O){var j=g[O];if(j<1)d[O]=-j;else for(y=0;y<j;++y){E[D]=O;do{D=D+M&W}while(D>=p)}}for(D&&f(0),y=0;y<h;++y){var C=d[E[y]]++,H=k[y]=u-b(C);m[y]=(C<<H)-h}return[o+7>>3,{b:u,s:E,n:k,t:m}]},p=function(r,n){var a=0,s=-1,i=new t(292),u=r[n],h=i.subarray(0,256),l=i.subarray(256,268),v=new e(i.buffer,268);if(u<128){var c=y(r,n+1,6),p=c[1],w=c[0]<<3,g=r[n+=u];g||f(0);for(var d=0,m=0,z=p.b,E=z,k=(++n<<3)-8+b(g);!((k-=z)<w);){var A=k>>3;if(h[++s]=p.s[d+=(r[A]|r[A+1]<<8)>>(7&k)&(1<<z)-1],(k-=E)<w)break;h[++s]=p.s[m+=(r[A=k>>3]|r[A+1]<<8)>>(7&k)&(1<<E)-1],z=p.n[d],d=p.t[d],E=p.n[m],m=p.t[m]}++s>255&&f(0)}else{for(s=u-127;a<s;a+=2){var T=r[++n];h[a]=T>>4,h[a+1]=15&T}++n}var x=0;for(a=0;a<s;++a)(I=h[a])>11&&f(0),x+=I&&1<<I-1;var F=b(x)+1,S=1<<F,B=S-x;for(B&B-1&&f(0),h[s++]=b(B)+1,a=0;a<s;++a){var I;++l[h[a]=(I=h[a])&&F+1-I]}var U=new t(S<<1),D=U.subarray(0,S),M=U.subarray(S);for(v[F]=0,a=F;a>0;--a){var W=v[a];o(M,a,W,v[a-1]=W+l[a]*(1<<F-a))}for(v[0]!=S&&f(0),a=0;a<s;++a){var O=h[a];if(O){var j=v[O];o(D,a,j,v[O]=j+(1<<F-O))}}return[n,{n:M,b:F,s:D}]},w=y(new t([81,16,99,140,49,198,24,99,12,33,196,24,99,102,102,134,70,146,4]),0,6)[1],g=y(new t([33,20,196,24,99,140,33,132,16,66,8,33,132,16,66,8,33,68,68,68,68,68,68,68,68,36,9]),0,6)[1],d=y(new t([32,132,16,66,102,70,68,68,68,68,36,73,2]),0,5)[1],m=function(r,t){for(var e=r.length,n=new s(e),a=0;a<e;++a)n[a]=t,t+=1<<r[a];return n},z=new t(new s([0,0,0,0,16843009,50528770,134678020,202050057,269422093]).buffer,0,36),E=m(z,0),k=new t(new s([0,0,0,0,0,0,0,0,16843009,50528770,117769220,185207048,252579084,16]).buffer,0,53),A=m(k,3),T=function(r,t,e){var n=r.length,a=t.length,s=r[n-1],i=(1<<e.b)-1,o=-e.b;s||f(0);for(var u=0,h=e.b,l=(n<<3)-8+b(s)-h,v=-1;l>o&&v<a;){var c=l>>3;t[++v]=e.s[u=(u<<h|(r[c]|r[c+1]<<8|r[c+2]<<16)>>(7&l))&i],l-=h=e.n[u]}l==o&&v+1==a||f(0)},x=function(r,t,e){var n=6,a=t.length+3>>2,s=a<<1,i=a+s;T(r.subarray(n,n+=r[0]|r[1]<<8),t.subarray(0,a),e),T(r.subarray(n,n+=r[2]|r[3]<<8),t.subarray(a,s),e),T(r.subarray(n,n+=r[4]|r[5]<<8),t.subarray(s,i),e),T(r.subarray(n),t.subarray(i),e)},F=function(r,n,a){var s,u=n.b,h=r[u],l=h>>1&3;n.l=1&h;var v=h>>3|r[u+1]<<5|r[u+2]<<13,c=(u+=3)+v;if(1==l){if(u>=r.length)return;return n.b=u+1,a?(o(a,r[u],n.y,n.y+=v),a):o(new t(v),r[u])}if(!(c>r.length)){if(0==l)return n.b=c,a?(a.set(r.subarray(u,c),n.y),n.y+=v,a):i(r,u,c);if(2==l){var m=r[u],F=3&m,S=m>>2&3,B=m>>4,I=0,U=0;F<2?1&S?B|=r[++u]<<4|(2&S&&r[++u]<<12):B=m>>3:(U=S,S<2?(B|=(63&r[++u])<<4,I=r[u]>>6|r[++u]<<2):2==S?(B|=r[++u]<<4|(3&r[++u])<<12,I=r[u]>>2|r[++u]<<6):(B|=r[++u]<<4|(63&r[++u])<<12,I=r[u]>>6|r[++u]<<2|r[++u]<<10)),++u;var D=a?a.subarray(n.y,n.y+n.m):new t(n.m),M=D.length-B;if(0==F)D.set(r.subarray(u,u+=B),M);else if(1==F)o(D,r[u++],M);else{var W=n.h;if(2==F){var O=p(r,u);I+=u-(u=O[0]),n.h=W=O[1]}else W||f(0);(U?x:T)(r.subarray(u,u+=I),D.subarray(M),W)}var j=r[u++];if(j){255==j?j=32512+(r[u++]|r[u++]<<8):j>127&&(j=j-128<<8|r[u++]);var C=r[u++];3&C&&f(0);for(var H=[g,d,w],L=2;L>-1;--L){var Z=C>>2+(L<<1)&3;if(1==Z){var q=new t([0,0,r[u++]]);H[L]={s:q.subarray(2,3),n:q.subarray(0,1),t:new e(q.buffer,0,1),b:0}}else 2==Z?(u=(s=y(r,u,9-(1&L)))[0],H[L]=s[1]):3==Z&&(n.t||f(0),H[L]=n.t[L])}var G=n.t=H,J=G[0],K=G[1],N=G[2],P=r[c-1];P||f(0);var Q=(c<<3)-8+b(P)-N.b,R=Q>>3,V=0,X=(r[R]|r[R+1]<<8)>>(7&Q)&(1<<N.b)-1,Y=(r[R=(Q-=K.b)>>3]|r[R+1]<<8)>>(7&Q)&(1<<K.b)-1,$=(r[R=(Q-=J.b)>>3]|r[R+1]<<8)>>(7&Q)&(1<<J.b)-1;for(++j;--j;){var _=N.s[X],rr=N.n[X],tr=J.s[$],er=J.n[$],nr=K.s[Y],ar=K.n[Y],sr=1<<nr,ir=sr+((r[R=(Q-=nr)>>3]|r[R+1]<<8|r[R+2]<<16|r[R+3]<<24)>>>(7&Q)&sr-1);R=(Q-=k[tr])>>3;var or=A[tr]+((r[R]|r[R+1]<<8|r[R+2]<<16)>>(7&Q)&(1<<k[tr])-1);R=(Q-=z[_])>>3;var ur=E[_]+((r[R]|r[R+1]<<8|r[R+2]<<16)>>(7&Q)&(1<<z[_])-1);if(R=(Q-=rr)>>3,X=N.t[X]+((r[R]|r[R+1]<<8)>>(7&Q)&(1<<rr)-1),R=(Q-=er)>>3,$=J.t[$]+((r[R]|r[R+1]<<8)>>(7&Q)&(1<<er)-1),R=(Q-=ar)>>3,Y=K.t[Y]+((r[R]|r[R+1]<<8)>>(7&Q)&(1<<ar)-1),ir>3)n.o[2]=n.o[1],n.o[1]=n.o[0],n.o[0]=ir-=3;else{var hr=ir-(0!=ur);hr?(ir=3==hr?n.o[0]-1:n.o[hr],hr>1&&(n.o[2]=n.o[1]),n.o[1]=n.o[0],n.o[0]=ir):ir=n.o[0]}for(L=0;L<ur;++L)D[V+L]=D[M+L];M+=ur;var fr=(V+=ur)-ir;if(fr<0){var lr=-fr,vr=n.e+fr;for(lr>or&&(lr=or),L=0;L<lr;++L)D[V+L]=n.w[vr+L];V+=lr,or-=lr,fr=0}for(L=0;L<or;++L)D[V+L]=D[fr+L];V+=or}if(V!=M)for(;M<D.length;)D[V++]=D[M++];else V=D.length;a?n.y+=V:D=i(D,0,V)}else if(a){if(n.y+=B,M)for(L=0;L<B;++L)D[L]=D[M+L]}else M&&(D=i(D,M));return n.b=c,D}f(2)}},S=function(r,e){if(1==r.length)return r[0];for(var n=new t(e),a=0,s=0;a<r.length;++a){var i=r[a];n.set(i,s),s+=i.length}return n};function B(r,t){for(var e=[],n=+!t,a=0,s=0;r.length;){var i=c(r,n||t);if("object"==typeof i){for(n?(t=null,i.w.length==i.u&&(e.push(t=i.w),s+=i.u)):(e.push(t),i.e=0);!i.l;){var o=F(r,i,t);o||f(5),t?i.e=i.y:(e.push(o),s+=o.length,u(i.w,0,o.length),i.w.set(o,i.w.length-o.length))}a=i.b+4*i.c}else a=i;r=r.subarray(a)}return S(e,s)}_e.decompress=B;var I=function(){function r(r){this.ondata=r,this.c=[],this.l=0,this.z=0}return r.prototype.push=function(r,e){if("number"==typeof this.s){var n=Math.min(r.length,this.s);r=r.subarray(n),this.s-=n}var a=r.length+this.l;if(!this.s){if(e){if(!a)return void this.ondata(new t(0),!0);a<5&&f(5)}else if(a<18)return this.c.push(r),void(this.l=a);if(this.l&&(this.c.push(r),r=S(this.c,a),this.c=[],this.l=0),"number"==typeof(this.s=c(r)))return this.push(r,e)}if("number"!=typeof this.s){if(a<(this.z||3))return e&&f(5),this.c.push(r),void(this.l=a);if(this.l&&(this.c.push(r),r=S(this.c,a),this.c=[],this.l=0),!this.z&&a<(this.z=2&r[this.s.b]?4:3+(r[this.s.b]>>3|r[this.s.b+1]<<5|r[this.s.b+2]<<13)))return e&&f(5),this.c.push(r),void(this.l=a);for(this.z=0;;){var s=F(r,this.s);if(!s){e&&f(5);var i=r.subarray(this.s.b);return this.s.b=0,this.c.push(i),void(this.l+=i.length)}if(this.ondata(s,!1),u(this.s.w,0,s.length),this.s.w.set(s,this.s.w.length-s.length),this.s.l){var o=r.subarray(this.s.b);return this.s=4*this.s.c,void this.push(o,e)}}}else e&&f(5)},r}();_e.Decompress=I;return _e})
+"use strict";
+const u64 = (d, o) => d.getUint32(o + 4, true) * 4294967296 + d.getUint32(o, true);
+const td = new TextDecoder();
+const MAGIC = [0x89, 0x4d, 0x43, 0x41, 0x50, 0x30, 0x0d, 0x0a];
+const LOGS = /^\/(blueos\/logs\/|docker\/logs\/|linux\/kernel$|logger\/events$)/;
+let blob, chunks = [], topics = new Map(), meta = {}, byChan = new Map(), isLog = new Set();
+let n = 0, cap = 0, times, chans, where, offs, lens, base = 0;
+const chunkCache = new Map(), parsed = new Map();
+
+function grow() {
+  cap = cap ? cap * 2 : 1 << 16;
+  const more = (T, old) => { const a = new T(cap); if (old) a.set(old); return a; };
+  times = more(Float64Array, times); chans = more(Uint16Array, chans); where = more(Int32Array, where);
+  offs = more(Float64Array, offs); lens = more(Uint32Array, lens);
+}
+function push(chan, ns, chunk, off, len) {
+  if (n === cap) grow();
+  if (n === 0) base = ns;
+  times[n] = (ns - base) / 1e9; chans[n] = chan; where[n] = chunk; offs[n] = off; lens[n] = len; n++;
+}
+function str(dv, b, o) { const l = dv.getUint32(o, true); return [td.decode(b.subarray(o + 4, o + 4 + l)), o + 4 + l]; }
+function strMap(dv, b, o) {
+  const end = o + 4 + dv.getUint32(o, true), m = {};
+  for (o += 4; o < end;) { let k, v; [k, o] = str(dv, b, o); [v, o] = str(dv, b, o); m[k] = v; }
+  return m;
+}
+function channel(dv, b, o) { topics.set(dv.getUint16(o, true), str(dv, b, o + 4)[0]); }
+function inflate(comp, bytes, size) {
+  if (comp === "") return bytes;
+  if (comp === "zstd") return fzstd.decompress(bytes);  // faster without an output buffer (measured: 6x)
+  throw new Error(`This file uses ${comp} compression, which the player can't read yet.`);
+}
+// Records of a chunk: channels and the place of each message, so a message is read again only when it's shown.
+function chunkRecords(raw, index) {
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  for (let q = 0; q + 9 <= raw.length;) {
+    const op = raw[q], len = u64(dv, q + 1), s = q + 9;
+    if (s + len > raw.length) break;
+    if (op === 0x04) channel(dv, raw, s);
+    else if (op === 0x05) push(dv.getUint16(s, true), u64(dv, s + 6), index, s + 22, len - 22);
+    q = s + len;
+  }
+}
+
+async function scan(progress) {
+  const size = blob.size, BLOCK = 16 << 20;
+  let buf = new Uint8Array(0), dv, at = 0, pos = 8, lastReport = 0;
+  const load = async (from, length) => {
+    buf = new Uint8Array(await blob.slice(from, Math.min(size, from + length)).arrayBuffer());
+    dv = new DataView(buf.buffer); at = from;
+  };
+  await load(0, BLOCK);
+  if (buf.length < 8 || MAGIC.some((v, i) => buf[i] !== v)) throw new Error("This isn't an MCAP file.");
+  while (pos + 9 <= size) {
+    if (pos + 9 > at + buf.length) await load(pos, BLOCK);
+    const r = pos - at, op = buf[r], len = u64(dv, r + 1), end = pos + 9 + len;
+    if (end > size) break;  // the file is still being written: its last record isn't complete yet
+    if (end > at + buf.length) { await load(pos, Math.max(BLOCK, 9 + len)); continue; }
+    const c = r + 9;
+    if (op === 0x0f || op === 0x02) break;  // the summary after the data repeats what was already read
+    if (op === 0x04) channel(dv, buf, c);
+    else if (op === 0x05) push(dv.getUint16(c, true), u64(dv, c + 6), -1, pos + 9 + 22, len - 22);
+    else if (op === 0x0c) { const [name, o] = str(dv, buf, c); meta[name] = strMap(dv, buf, o); }
+    else if (op === 0x06) {
+      const usize = u64(dv, c + 16), [comp, o] = str(dv, buf, c + 28), rl = u64(dv, o);
+      chunks.push({ pos: at + o + 8, len: rl, comp, usize });
+      const raw = inflate(comp, buf.subarray(o + 8, o + 8 + rl), usize);
+      chunkRecords(raw, chunks.length - 1);
+    }
+    pos = end;
+    if (performance.now() - lastReport > 100) { lastReport = performance.now(); progress(pos / size); }
+  }
+}
+
+function sortByTime() {
+  let sorted = true;
+  for (let i = 1; i < n && sorted; i++) sorted = times[i] >= times[i - 1];
+  if (!sorted) {
+    const order = Uint32Array.from({ length: n }, (_, i) => i).sort((a, b) => times[a] - times[b]);
+    const pick = (a) => { const o = a.slice(0, n); for (let i = 0; i < n; i++) o[i] = a[order[i]]; return o; };
+    times = pick(times); chans = pick(chans); where = pick(where); offs = pick(offs); lens = pick(lens);
+  }
+  const first = times[0];  // the earliest message is time 0
+  if (first) { for (let i = 0; i < n; i++) times[i] -= first; base += first * 1e9; }
+}
+
+async function chunk(i) {
+  let raw = chunkCache.get(i);
+  if (raw) { chunkCache.delete(i); chunkCache.set(i, raw); return raw; }
+  const c = chunks[i];
+  raw = inflate(c.comp, new Uint8Array(await blob.slice(c.pos, c.pos + c.len).arrayBuffer()), c.usize);
+  chunkCache.set(i, raw);
+  if (chunkCache.size > 48) chunkCache.delete(chunkCache.keys().next().value);
+  return raw;
+}
+async function bytesOf(i) {
+  if (where[i] < 0) return new Uint8Array(await blob.slice(offs[i], offs[i] + lens[i]).arrayBuffer());
+  return (await chunk(where[i])).subarray(offs[i], offs[i] + lens[i]);
+}
+const decode = (bytes) => { const text = td.decode(bytes); try { return JSON.parse(text); } catch { return { data: text }; } };
+async function message(i, keep = true) {
+  let m = parsed.get(i);
+  if (m) return m;
+  m = decode(await bytesOf(i));
+  if (keep) { parsed.set(i, m); if (parsed.size > 4000) parsed.delete(parsed.keys().next().value); }
+  return m;
+}
+
+// Index of the last entry at or before t: in all messages, or in one channel's list.
+function lastAt(t, list) {
+  let lo = 0, hi = list ? list.length : n;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (times[list ? list[mid] : mid] <= t) lo = mid + 1; else hi = mid; }
+  return lo - 1;
+}
+
+function logLine(topic, env) {
+  const d = env.data ?? {};
+  let src, text, level = "", stream = "";
+  if (topic.startsWith("/blueos/logs/")) { src = topic.slice(13); text = d.line; }
+  else if (topic.startsWith("/docker/logs/")) { src = topic.slice(13).replace(/^extension-/, ""); text = d.line; stream = d.stream || ""; }
+  else if (topic === "/linux/kernel") {
+    src = "kernel"; text = d.message;
+    level = /^(emerg|alert|crit|err)/.test(d.level) ? "error" : /^warn/.test(d.level) ? "warn" : d.level === "debug" ? "debug" : "info";
+  } else { src = "logger"; text = d.event; }
+  text = typeof text === "string" ? text : JSON.stringify(d);
+  if (!level) level = /\b(ERROR|CRITICAL|FATAL|PANIC)\b|Traceback/.test(text) ? "error"
+    : /\b(WARN|WARNING)\b/.test(text) ? "warn" : /\b(DEBUG|TRACE)\b/.test(text) ? "debug" : "info";
+  return { src, text, level, stream };
+}
+const RANK = { debug: 0, info: 1, warn: 2, error: 3 };
+
+async function logs({ t, src, text, level, limit }) {
+  const lines = [], needle = text ? text.toLowerCase() : "", min = level === "error" ? 3 : level === "warn" ? 2 : 0;
+  let i = lastAt(t);
+  for (let steps = 0; i >= 0 && lines.length < limit && steps < 300000; i--, steps++) {
+    const chan = chans[i];
+    if (!isLog.has(chan) || (src && topics.get(chan) !== src)) continue;
+    if (needle && !td.decode(await bytesOf(i)).toLowerCase().includes(needle)) continue;
+    const line = logLine(topics.get(chan), await message(i));
+    if (RANK[line.level] < min) continue;
+    lines.push({ i, t: times[i], ...line });
+  }
+  return { lines: lines.reverse(), complete: i < 0 };
+}
+
+async function state(q) {
+  const out = { t: q.t, fresh: [], vehicle: {} };
+  for (const [chan, list] of byChan) {
+    const k = lastAt(q.t, list);
+    if (k >= 0 && times[list[k]] > q.t - 1) out.fresh.push(chan);
+  }
+  if (q.chan != null && byChan.has(q.chan)) {
+    const list = byChan.get(q.chan), k = lastAt(q.t, list);
+    out.inspect = { chan: q.chan, k, count: list.length,
+                    time: k >= 0 ? times[list[k]] : null, first: times[list[0]],
+                    prev: k > 0 ? times[list[k - 1]] : null, next: k + 1 < list.length ? times[list[k + 1]] : null,
+                    data: k >= 0 ? await message(list[k]) : null };
+  }
+  for (const chan of q.vehicle) {
+    const list = byChan.get(chan), k = list ? lastAt(q.t, list) : -1;
+    if (k >= 0) out.vehicle[chan] = { time: times[list[k]], data: (await message(list[k])).data };
+  }
+  if (q.logs) out.logs = await logs({ t: q.t, ...q.logs });
+  return out;
+}
+
+// Every number of the asked topics in one pass, since a pass decompresses the whole file: plotting another field, or
+// another topic of the same pass, is then instant. A topic with more numbers than this (a process list) gets the one
+// asked for too. ponytail: one pass per question, a pass already running doesn't take in new topics.
+const MAX_COLUMNS = 64;
+async function series({ id, wanted, want }) {
+  const jobs = new Map(wanted.filter((c) => byChan.has(c)).map((c) => [c, {
+    k: 0, ts: new Float64Array(byChan.get(c).length), columns: new Map(), want: want[c] }]));
+  const walk = (job, v, p) => {
+    if (typeof v === "number" || typeof v === "boolean") {
+      const key = JSON.stringify(p);
+      let c = job.columns.get(key);
+      if (!c && (job.columns.size < MAX_COLUMNS || key === job.want)) {
+        c = new Float64Array(job.ts.length).fill(NaN);
+        job.columns.set(key, c);
+      }
+      if (c) c[job.k] = +v;
+    } else if (v && typeof v === "object") for (const k in v) walk(job, v[k], [...p, Array.isArray(v) ? +k : k]);
+  };
+  let last = performance.now();
+  for (let i = 0; i < n; i++) {
+    const job = jobs.get(chans[i]);
+    if (!job) continue;
+    job.ts[job.k] = times[i];
+    walk(job, (await message(i, false)).data, ["data"]);
+    job.k++;
+    // Reading each chunk from the file awaits, which already lets the page's own questions in meanwhile.
+    if (performance.now() - last > 80) { postMessage({ id, progress: i / n }); last = performance.now(); }
+  }
+  return Object.fromEntries([...jobs].map(([c, j]) => [c, { times: j.ts, columns: Object.fromEntries(j.columns) }]));
+}
+
+async function open(file) {
+  blob = file;
+  await scan((p) => postMessage({ progress: p }));
+  if (!n) throw new Error("This file has no messages yet.");
+  sortByTime();
+  const counts = new Map();
+  for (let i = 0; i < n; i++) counts.set(chans[i], (counts.get(chans[i]) || 0) + 1);
+  for (const [chan, count] of counts) byChan.set(chan, new Uint32Array(count));
+  const fill = new Map();
+  for (let i = 0; i < n; i++) { const c = chans[i], k = fill.get(c) || 0; byChan.get(c)[k] = i; fill.set(c, k + 1); }
+  for (const [chan, topic] of topics) if (LOGS.test(topic) && byChan.has(chan)) isLog.add(chan);
+  const duration = times[n - 1], bins = new Uint32Array(1000);
+  for (let i = 0; i < n; i++) bins[Math.min(999, Math.floor(times[i] / (duration || 1) * 1000))]++;
+  // Times as the best known UTC: the reference the run reached (its metadata, or the last /time/sync), applied to
+  // mono_ns, which is what the downloaded file does too. A downloaded file already has it, so the offset is 0 there.
+  let reference = null;
+  if (meta.time) reference = { shift: Number(meta.time.shift_ns), synced: meta.time.synced === "True", source: meta.time.source };
+  else {
+    const sync = [...topics].find(([, t]) => t === "/time/sync")?.[0], list = byChan.get(sync);
+    const d = list && (await message(list[list.length - 1])).data;
+    if (d && d.shift_ns != null) reference = { shift: d.shift_ns, synced: d.synced, source: d.source };
+  }
+  const first = await message(0);
+  const offset = reference && typeof first.mono_ns === "number" ? reference.shift - (base - first.mono_ns) : 0;
+  const events = [...topics].find(([, t]) => t === "/logger/events")?.[0];
+  return {
+    ready: true, count: n, duration, base: base + offset, chunks: chunks.length, meta,
+    clock: reference && { synced: reference.synced, source: reference.source },
+    topics: [...byChan].map(([chan, list]) => ({ chan, topic: topics.get(chan) ?? `#${chan}`, count: list.length })),
+    logSources: [...isLog].map((c) => topics.get(c)).sort(),
+    density: bins, events: events != null && byChan.has(events) ? Array.from(byChan.get(events), (i) => times[i]) : [],
+  };
+}
+
+onmessage = async ({ data: q }) => {
+  try {
+    const result = q.open ? await open(q.open) : q.state ? await state(q.state) : await series({ id: q.id, ...q.series });
+    const buffers = q.series ? Object.values(result).flatMap((r) => [r.times, ...Object.values(r.columns)].map((a) => a.buffer)) : [];
+    postMessage({ id: q.id, result }, buffers);
+  } catch (error) {
+    postMessage({ id: q.id, error: String(error.message || error) });
+  }
+};
+</script>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const fmt = new Intl.NumberFormat();
+const sizeText = (b) => b < 2 ** 20 ? `${(b / 1024).toFixed(0)} KB` : b < 2 ** 30 ? `${(b / 2 ** 20).toFixed(1)} MB` : `${(b / 2 ** 30).toFixed(2)} GB`;
+const short = (v) => v < 1000 ? String(v) : v < 1e6 ? `${(v / 1e3).toFixed(v < 1e4 ? 1 : 0)}k` : `${(v / 1e6).toFixed(1)}M`;
+const icons = {
+  play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="5" width="4" height="14" rx="1"/><rect x="13.5" y="5" width="4" height="14" rx="1"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+};
+const COLORS = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#a855f7", "#06b6d4", "#ec4899", "#84cc16"];
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Elapsed time: 4:05.3 or 1:02:05.3
+function elapsed(s, decimals = 1) {
+  const sign = s < 0 ? "-" : "", a = Math.abs(s), h = Math.floor(a / 3600), m = Math.floor(a % 3600 / 60);
+  const sec = (a % 60).toFixed(decimals).padStart(decimals ? 3 + decimals : 2, "0");
+  return h ? `${sign}${h}:${String(m).padStart(2, "0")}:${sec}` : `${sign}${m}:${sec}`;
+}
+const clockFmt = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const dateFmt = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+const absMs = (t) => file.base / 1e6 + t * 1000;
+function clockText(t, tenths = true) {
+  const ms = absMs(t);
+  return clockFmt.format(ms) + (tenths ? `.${Math.floor((ms % 1000 + 1000) % 1000 / 100)}` : "");
+}
+
+// ---------- The worker ----------
+let worker = null, nextId = 1;
+const pending = new Map();
+function startWorker() {
+  worker?.terminate();
+  pending.clear();
+  const url = URL.createObjectURL(new Blob([$("worker-src").textContent], { type: "text/javascript" }));
+  worker = new Worker(url);
+  URL.revokeObjectURL(url);
+  worker.onmessage = ({ data }) => {
+    if (data.id == null) { onScanProgress?.(data.progress); return; }
+    const p = pending.get(data.id);
+    if (!p) return;
+    if (data.progress != null) { p.progress?.(data.progress); return; }
+    pending.delete(data.id);
+    data.error ? p.reject(new Error(data.error)) : p.resolve(data.result);
+  };
+}
+function ask(query, progress) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => { pending.set(id, { resolve, reject, progress }); worker.postMessage({ id, ...query }); });
+}
+let onScanProgress = null;
+
+// ---------- Views ----------
+function show(view) {
+  for (const v of ["pick", "loading", "play"]) $(v).hidden = v !== view;
+  $("open-another").hidden = view !== "play";
+  if (view !== "play") $("file-info").innerHTML = "";
+}
+
+let file = null;           // what the worker said about the open file
+let label = "";
+let fetchAbort = null;
+
+function loadingView(title) {
+  show("loading");
+  $("loading-card").classList.remove("bad");
+  $("load-title").textContent = title;
+  $("load-bar").style.width = "0";
+  $("load-detail").textContent = "";
+  $("load-cancel").textContent = "Cancel";
+}
+function loadFailed(message) {
+  $("loading-card").classList.add("bad");
+  $("load-title").textContent = message;
+  $("load-detail").textContent = "";
+  $("load-cancel").textContent = "Back";
+}
+
+async function openBlob(blob, name, info = {}) {
+  pause();
+  startWorker();
+  loadingView(`Reading ${name}`);
+  onScanProgress = (p) => {
+    $("load-bar").style.width = `${p * 100}%`;
+    $("load-detail").textContent = `${Math.round(p * 100)}% of ${sizeText(blob.size)}`;
+  };
+  try {
+    file = await ask({ open: blob });
+  } catch (error) {
+    loadFailed(error.message);
+    return;
+  }
+  label = name;
+  file.size = blob.size;
+  file.live = !!info.live;
+  setupPlayer();
+}
+
+async function openFromVehicle(rec) {
+  history.replaceState(null, "", `#file=${encodeURIComponent(rec.name)}`);
+  loadingView(`Downloading ${rec.number != null ? `#${rec.number}` : rec.name} from the vehicle`);
+  fetchAbort = new AbortController();
+  try {
+    const response = await fetch(`raw/${encodeURIComponent(rec.name)}`, { signal: fetchAbort.signal });
+    if (!response.ok) throw new Error(response.status === 404 ? "This recording isn't on the vehicle anymore." : `The vehicle answered ${response.status}.`);
+    const total = Number(response.headers.get("Content-Length")) || rec.size || 0;
+    const reader = response.body.getReader(), parts = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value); got += value.length;
+      $("load-bar").style.width = total ? `${got / total * 100}%` : "30%";
+      $("load-detail").textContent = total ? `${sizeText(got)} of ${sizeText(total)}` : sizeText(got);
+    }
+    fetchAbort = null;
+    await openBlob(new Blob(parts), rec.name, { live: rec.active });
+  } catch (error) {
+    fetchAbort = null;
+    if (error.name === "AbortError") return;
+    loadFailed(error.message === "Failed to fetch" ? "Couldn't reach the vehicle." : error.message);
+  }
+}
+
+$("load-cancel").addEventListener("click", () => {
+  fetchAbort?.abort();
+  worker?.terminate(); worker = null;
+  backToPick();
+});
+$("open-another").addEventListener("click", backToPick);
+function backToPick() {
+  pause();
+  file = null;
+  history.replaceState(null, "", location.pathname + location.search);
+  show("pick");
+  listVehicle();
+}
+
+// ---------- Choosing ----------
+$("file-input").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  e.target.value = "";
+  if (f) { history.replaceState(null, "", location.pathname + location.search); openBlob(f, f.name); }
+});
+let dragDepth = 0;
+addEventListener("dragenter", (e) => {
+  if (![...e.dataTransfer.types].includes("Files")) return;
+  e.preventDefault();
+  if (++dragDepth === 1) { $("drop-overlay").classList.add("show"); $("drop").classList.add("over"); }
+});
+addEventListener("dragleave", () => {
+  if (dragDepth && --dragDepth === 0) { $("drop-overlay").classList.remove("show"); $("drop").classList.remove("over"); }
+});
+addEventListener("dragover", (e) => e.preventDefault());
+addEventListener("drop", (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  $("drop-overlay").classList.remove("show"); $("drop").classList.remove("over");
+  const f = e.dataTransfer.files[0];
+  if (f) { fetchAbort?.abort(); history.replaceState(null, "", location.pathname + location.search); openBlob(f, f.name); }
+});
+
+let vehicleRecordings = [];
+async function listVehicle() {
+  const ul = $("vehicle-list");
+  try {
+    const response = await fetch("status", { cache: "no-store", signal: AbortSignal.timeout(5000) });
+    vehicleRecordings = (await response.json()).recordings;
+  } catch {
+    ul.innerHTML = '<li class="note">Couldn\'t reach the logger on the vehicle. Files from this computer still open.</li>';
+    return;
+  }
+  if (!vehicleRecordings.length) { ul.innerHTML = '<li class="note">No recordings on the vehicle yet.</li>'; return; }
+  ul.innerHTML = vehicleRecordings.map((r, i) => {
+    const start = r.start ? new Date(r.start) : null, end = r.end ? new Date(r.end) : null;
+    const when = start ? `${dateFmt.format(start)}, ${clockFmt.format(start)}` : "Time unknown";
+    const dur = start && end ? elapsed((end - start) / 1000, 0) : "";
+    return `<li class="vf">
+      <span class="n">${r.number != null ? `#${r.number}` : ""}</span>
+      <div class="meta"><div class="when num">${esc(when)}${dur ? ` <span class="sub">· ${dur}</span>` : ""}</div>
+        <div class="sub num">${r.active ? '<span class="badge live">Recording</span> ' : ""}${sizeText(r.size)} · ${esc(r.name)}</div></div>
+      <button class="btn primary" type="button" data-i="${i}" aria-label="Play ${esc(r.name)}">${icons.play}Play</button>
+    </li>`;
+  }).join("");
+}
+$("vehicle-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-i]");
+  if (b) openFromVehicle(vehicleRecordings[+b.dataset.i]);
+});
+
+// ---------- Playing ----------
+let t = 0, playing = false, speed = 1, zoom = null, selected = null;
+let topicByChan = new Map(), vehicleChans = {}, series = [];
+
+function setupPlayer() {
+  t = 0; zoom = null; series = []; selected = null; columnCache = new Map();
+  topicByChan = new Map(file.topics.map((x) => [x.chan, x.topic]));
+  show("play");
+  const start = new Date(absMs(0));
+  const clock = file.clock
+    ? `<span class="badge ${file.clock.synced ? "yes" : "no"}" title="Where the times come from">${file.clock.synced ? `Time from ${esc(file.clock.source)}` : "Clock not synchronized: times may be off"}</span>`
+    : '<span class="badge no" title="No time reference in this file">Times as recorded</span>';
+  $("file-info").innerHTML = `<strong>${esc(label)}</strong>
+    <span class="num">${esc(dateFmt.format(start))}, ${esc(clockFmt.format(start))}</span>
+    <span class="num">${elapsed(file.duration, 0)}</span>
+    <span class="num">${fmt.format(file.count)} messages · ${file.topics.length} topics · ${sizeText(file.size)}</span>
+    ${file.live ? '<span class="badge live" title="Still being recorded: this is what was on the card when it was opened">Snapshot of the current recording</span>' : ""}
+    ${clock}`;
+  $("scrub").setAttribute("aria-valuemax", String(Math.round(file.duration)));
+  $("log-src").innerHTML = '<option value="">All sources</option>'
+    + file.logSources.map((s) => `<option value="${esc(s)}">${esc(s.replace(/^\/(blueos\/logs|docker\/logs)\//, "").replace(/^extension-/, ""))}</option>`).join("");
+  findVehicle();
+  renderTopics();
+  const preferred = vehicleChans.heartbeat ?? file.topics.find((x) => x.topic.startsWith("/mavlink/"))?.chan ?? file.topics[0].chan;
+  selectTopic(preferred);
+  renderPlots();
+  sizeCanvases();
+  drawScrub();
+  armedBands = [];
+  if (vehicleChans.heartbeat != null) {
+    // When the autopilot was armed, drawn under the timeline: the whole HEARTBEAT topic, read in the background.
+    columnOf(vehicleChans.heartbeat, ["data", "message", "base_mode", "bits"]).then((s) => {
+      let from = null;
+      for (let k = 0; k < s.times.length; k++) {
+        const on = (s.values[k] & 128) !== 0;
+        if (on && from === null) from = s.times[k];
+        if (!on && from !== null) { armedBands.push([from, s.times[k]]); from = null; }
+      }
+      if (from !== null) armedBands.push([from, file.duration]);
+      drawScrub();
+    }).catch(() => {});
+  }
+  seek(0);
+}
+
+// ---------- Topics ----------
+function groupOf(topic) {
+  let m;
+  if ((m = topic.match(/^\/mavlink\/(\d+)\/(\d+)\/(.+)$/))) return [`MAVLink ${m[1]}/${m[2]}`, m[3]];
+  if ((m = topic.match(/^\/blueos\/logs\/(.+)$/))) return ["Service logs", m[1]];
+  if ((m = topic.match(/^\/blueos\/(.+)$/))) return ["BlueOS services", m[1]];
+  if ((m = topic.match(/^\/docker\/logs\/(.+)$/))) return ["Container logs", m[1].replace(/^extension-/, "")];
+  if ((m = topic.match(/^\/(linux|docker)\/(.+)$/))) return [m[1] === "linux" ? "Linux" : "Docker", m[2]];
+  if ((m = topic.match(/^\/(logger|time)\/(.+)$/))) return ["Logger", `${m[1]}/${m[2]}`];
+  return ["Other", topic];
+}
+const closedGroups = new Set(["Container logs", "Service logs"]);
+function renderTopics() {
+  const needle = $("topic-filter").value.trim().toLowerCase();
+  const groups = new Map();
+  for (const x of [...file.topics].sort((a, b) => a.topic.localeCompare(b.topic))) {
+    if (needle && !x.topic.toLowerCase().includes(needle)) continue;
+    const [g, name] = groupOf(x.topic);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push({ ...x, name });
+  }
+  const order = (g) => g.startsWith("MAVLink") ? 0 : g === "BlueOS services" ? 1 : g === "Logger" ? 4 : g === "Other" ? 5 : 2;
+  $("topics").innerHTML = [...groups].sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0])).map(([g, items]) => `
+    <details class="group" data-group="${esc(g)}" ${needle || !closedGroups.has(g) ? "open" : ""}>
+      <summary>${esc(g)}<span class="c num">${items.length}</span></summary>
+      ${items.map((x) => `<button class="topic" type="button" data-chan="${x.chan}" title="${esc(x.topic)} · ${fmt.format(x.count)} messages"
+        aria-current="${x.chan === selected}"><span class="dot" aria-hidden="true"></span><span class="name">${esc(x.name)}</span><span class="count num">${short(x.count)}</span></button>`).join("")}
+    </details>`).join("") || '<div class="note" style="padding:8px">No topic matches.</div>';
+  dots = new Map([...$("topics").querySelectorAll(".topic")].map((b) => [+b.dataset.chan, b.querySelector(".dot")]));
+}
+let dots = new Map();
+$("topic-filter").addEventListener("input", renderTopics);
+$("topics").addEventListener("toggle", (e) => {
+  const g = e.target.dataset?.group;
+  if (g && !$("topic-filter").value) e.target.open ? closedGroups.delete(g) : closedGroups.add(g);
+}, true);
+$("topics").addEventListener("click", (e) => {
+  const b = e.target.closest(".topic");
+  if (b) selectTopic(+b.dataset.chan);
+});
+function selectTopic(chan) {
+  if (selected !== chan) { previousLeaves = new Map(); shownMessage = null; }
+  selected = chan;
+  for (const b of $("topics").querySelectorAll(".topic")) b.setAttribute("aria-current", String(+b.dataset.chan === chan));
+  $("insp-title").textContent = topicByChan.get(chan);
+  refresh();
+}
+
+// ---------- Vehicle summary ----------
+function findVehicle() {
+  vehicleChans = {};
+  const hb = file.topics.find((x) => /^\/mavlink\/\d+\/1\/HEARTBEAT$/.test(x.topic));
+  if (!hb) { $("vehicle").hidden = true; return; }
+  const prefix = hb.topic.replace(/HEARTBEAT$/, "");
+  const chanOf = (name) => file.topics.find((x) => x.topic === prefix + name)?.chan;
+  vehicleChans = { heartbeat: hb.chan, sys: chanOf("SYS_STATUS"), hud: chanOf("VFR_HUD"), att: chanOf("ATTITUDE") };
+  $("vehicle").hidden = false;
+}
+const deg = (rad) => `${(rad * 180 / Math.PI).toFixed(1)}°`;
+function renderVehicle(v) {
+  if ($("vehicle").hidden) return;
+  const msg = (key) => v[vehicleChans[key]];
+  const tiles = [];
+  const hb = msg("heartbeat"), stale = (m) => !m || t - m.time > 5;
+  const armed = hb ? (hb.data.message.base_mode.bits & 128) !== 0 : null;
+  tiles.push(["State", armed == null ? "–" : armed ? "ARMED" : "Disarmed", armed ? "armed" : stale(hb) ? "stale" : ""]);
+  const type = hb?.data.message.mavtype?.type?.replace(/^MAV_TYPE_/, "").replace(/_/g, " ").toLowerCase();
+  if (type) tiles.push(["Vehicle", type.charAt(0).toUpperCase() + type.slice(1), stale(hb) ? "stale" : ""]);
+  const sys = msg("sys")?.data.message;
+  if (sys) tiles.push(["Battery", sys.voltage_battery > 0 ? `${(sys.voltage_battery / 1000).toFixed(2)} V${sys.battery_remaining >= 0 ? ` · ${sys.battery_remaining}%` : ""}` : "–", stale(msg("sys")) ? "stale" : ""]);
+  const hud = msg("hud")?.data.message;
+  if (hud) {
+    tiles.push(["Heading", `${hud.heading}°`, stale(msg("hud")) ? "stale" : ""]);
+    tiles.push(["Altitude", `${hud.alt.toFixed(2)} m`, stale(msg("hud")) ? "stale" : ""]);
+    tiles.push(["Speed", `${hud.groundspeed.toFixed(2)} m/s`, stale(msg("hud")) ? "stale" : ""]);
+  }
+  const att = msg("att")?.data.message;
+  if (att) for (const k of ["roll", "pitch"]) tiles.push([k[0].toUpperCase() + k.slice(1), deg(att[k]), stale(msg("att")) ? "stale" : ""]);
+  const html = tiles.map(([l, val, cls]) => `<div class="tile ${cls}" ${cls === "stale" ? 'title="Nothing newer than 5 s before this moment"' : ""}><span class="label">${l}</span><span class="value num">${esc(val)}</span></div>`).join("");
+  if ($("vehicle").innerHTML !== html) $("vehicle").innerHTML = html;
+}
+
+// ---------- Inspector ----------
+let shownMessage = null, inspectTimes = null, previousLeaves = new Map(), currentData = null;
+const openPaths = new Set(['[]', '["data"]', '["data","message"]']);
+const plotted = () => new Set(series.filter((s) => s.chan === selected).map((s) => JSON.stringify(s.path)));
+function renderInspector(info) {
+  inspectTimes = info;
+  const meta = info.k < 0
+    ? `First message at ${elapsed(info.first)}`
+    : `${fmt.format(info.k + 1)} of ${fmt.format(info.count)} · ${t - info.time < 0.05 ? "now" : `${elapsed(t - info.time)} ago`}`;
+  $("insp-meta").textContent = meta;
+  $("insp-prev").disabled = info.prev == null && info.k < 0;
+  $("insp-next").disabled = info.next == null && !(info.k < 0);
+  const key = `${info.chan}:${info.k}`;
+  if (key === shownMessage) return;
+  shownMessage = key;
+  currentData = info.data;
+  drawTree();
+}
+function drawTree() {
+  const tree = $("tree");
+  if (!currentData) { tree.innerHTML = '<div class="empty">No message on this topic yet at this point of the recording.</div>'; return; }
+  const out = [], leaves = new Map(), plots = plotted();
+  const walk = (value, key, path, depth) => {
+    const p = JSON.stringify(path);
+    if (value !== null && typeof value === "object") {
+      const entries = Array.isArray(value) ? value.map((v, i) => [i, v]) : Object.entries(value);
+      const open = openPaths.has(p);
+      const sum = Array.isArray(value) ? `[${value.length}]` : `{${entries.length}}`;
+      if (key !== null) out.push(`<div class="row" style="--d:${depth}"><button class="tog" type="button" data-p="${esc(p)}" aria-expanded="${open}"><span class="k">${esc(key)}</span><span class="sum">${sum}</span></button></div>`);
+      if (key === null || open) {
+        const limit = openPaths.has(`${p}+`) ? 5000 : 200;
+        for (const [k, v] of entries.slice(0, limit)) walk(v, k, [...path, k], depth + (key === null ? 0 : 1));
+        if (entries.length > limit) out.push(`<button class="more" type="button" style="--d:${depth}" data-more="${esc(p)}">Show ${fmt.format(entries.length - limit)} more</button>`);
+      }
+      return;
+    }
+    const type = typeof value === "number" ? "n" : typeof value === "string" ? "s" : typeof value === "boolean" ? "b" : "z";
+    const text = type === "s" ? JSON.stringify(value) : String(value);
+    leaves.set(p, text);
+    const changed = previousLeaves.has(p) && previousLeaves.get(p) !== text;
+    const canPlot = type === "n" || type === "b";
+    out.push(`<div class="row${changed ? " chg" : ""}" style="--d:${depth}"><span class="k">${esc(key)}</span><span class="v ${type}">${esc(text.length > 2000 ? text.slice(0, 2000) + "…" : text)}</span>${canPlot
+      ? `<button class="plot${plots.has(p) ? " on" : ""}" type="button" data-plot="${esc(p)}" title="Plot over the whole recording">${plots.has(p) ? "Plotted" : "+ Plot"}</button>` : ""}</div>`);
+  };
+  // The envelope's times are shown in the header; the tree starts at what was recorded.
+  const { data, ...envelope } = currentData;
+  walk({ data, ...(Object.keys(envelope).length ? { envelope } : {}) }, null, [], 0);
+  previousLeaves = leaves;
+  tree.innerHTML = out.join("");
+}
+$("tree").addEventListener("click", (e) => {
+  const tog = e.target.closest(".tog"), more = e.target.closest(".more"), plot = e.target.closest(".plot");
+  if (tog) { const p = tog.dataset.p; openPaths.has(p) ? openPaths.delete(p) : openPaths.add(p); drawTree(); }
+  else if (more) { openPaths.add(`${more.dataset.more}+`); drawTree(); }
+  else if (plot) {
+    const path = JSON.parse(plot.dataset.plot);
+    const existing = series.find((s) => s.chan === selected && JSON.stringify(s.path) === plot.dataset.plot);
+    existing ? removeSeries(existing) : addSeries(selected, path);
+    drawTree();
+  }
+});
+$("insp-prev").addEventListener("click", () => stepMessage(-1));
+$("insp-next").addEventListener("click", () => stepMessage(1));
+function stepMessage(dir) {
+  const i = inspectTimes;
+  if (!i) return;
+  if (dir > 0) seek(i.k < 0 ? i.first : i.next ?? t);
+  else if (i.prev != null) seek(i.prev);
+}
+
+// ---------- Logs ----------
+let logKey = "", logFollow = true;
+const logQuery = () => ({ text: $("log-text").value.trim(), level: $("log-level").value, src: $("log-src").value, limit: 300 });
+function renderLogs(res) {
+  const list = $("logs");
+  const key = res.lines.length ? `${res.lines[0].i}-${res.lines.at(-1).i}-${res.lines.length}` : "none";
+  if (key === logKey) return;
+  logKey = key;
+  if (!res.lines.length) { list.innerHTML = `<div class="empty">${file.logSources.length ? "No log lines up to this point." : "This file has no logs."}</div>`; return; }
+  const day = (s) => clockText(s);
+  list.innerHTML = (res.complete ? "" : '<div class="empty">Earlier lines: move back in time to see them.</div>')
+    + res.lines.map((l, k) => `<div class="log ${l.level}${k === res.lines.length - 1 ? " now" : ""}" data-t="${l.t}" title="${esc(topicByChan.size ? l.src : "")}${l.stream === "stderr" ? " · stderr" : ""} · click to go here">
+      <span class="t num">${day(l.t)}</span><span class="src">${esc(l.src)}</span><span class="txt">${esc(l.text)}</span></div>`).join("");
+  if (logFollow) list.scrollTop = list.scrollHeight;
+}
+$("logs").addEventListener("scroll", () => {
+  const l = $("logs");
+  logFollow = l.scrollHeight - l.scrollTop - l.clientHeight < 30;
+});
+$("logs").addEventListener("click", (e) => {
+  const row = e.target.closest(".log");
+  if (row && !getSelection().toString()) seek(+row.dataset.t);
+});
+let logDebounce;
+$("log-text").addEventListener("input", () => { clearTimeout(logDebounce); logDebounce = setTimeout(() => { logKey = ""; logFollow = true; refresh(); }, 250); });
+for (const id of ["log-level", "log-src"]) $(id).addEventListener("change", () => { logKey = ""; logFollow = true; refresh(); });
+
+// ---------- Asking the worker for the state at t, one question at a time ----------
+let busy = false, again = false;
+async function refresh() {
+  if (!file || !worker) return;
+  if (busy) { again = true; return; }
+  busy = true;
+  try {
+    const s = await ask({ state: { t, chan: selected, vehicle: Object.values(vehicleChans).filter((c) => c != null), logs: logQuery() } });
+    if (!file) return;
+    const fresh = new Set(s.fresh);
+    for (const [chan, dot] of dots) dot.classList.toggle("fresh", fresh.has(chan));
+    if (s.inspect && s.inspect.chan === selected) renderInspector(s.inspect);
+    renderVehicle(s.vehicle);
+    if (s.logs) renderLogs(s.logs);
+  } catch (error) {
+    console.error(error);
+  } finally {
+    busy = false;
+    if (again) { again = false; refresh(); }
+  }
+}
+
+// ---------- Time ----------
+function seek(to) {
+  t = Math.max(0, Math.min(file.duration, to));
+  logFollow = true;
+  drawTime();
+  refresh();
+}
+function drawTime() {
+  $("t-abs").textContent = clockText(t);
+  $("t-rel").textContent = `${elapsed(t)} / ${elapsed(file.duration)}`;
+  $("t-abs").title = new Date(absMs(t)).toISOString();
+  $("scrub-head").style.left = `${t / (file.duration || 1) * 100}%`;
+  $("scrub").setAttribute("aria-valuenow", String(Math.round(t)));
+  $("scrub").setAttribute("aria-valuetext", `${clockText(t, false)}, ${elapsed(t, 0)} into the recording`);
+  for (const s of series) drawPlotCursor(s);
+}
+let raf = 0, lastFrame = 0;
+function frame(now) {
+  if (!playing) return;
+  t += (now - lastFrame) / 1000 * speed;
+  lastFrame = now;
+  if (t >= file.duration) { t = file.duration; pause(); }
+  drawTime();
+  refresh();
+  raf = requestAnimationFrame(frame);
+}
+function play() {
+  if (!file) return;
+  if (t >= file.duration) t = 0;
+  playing = true;
+  lastFrame = performance.now();
+  raf = requestAnimationFrame(frame);
+  drawPlayButton();
+}
+function pause() {
+  playing = false;
+  cancelAnimationFrame(raf);
+  drawPlayButton();
+}
+function drawPlayButton() {
+  $("play-btn").innerHTML = playing ? icons.pause : icons.play;
+  $("play-btn").setAttribute("aria-label", playing ? "Pause" : "Play");
+  $("play-btn").title = playing ? "Pause (Space)" : "Play (Space)";
+}
+drawPlayButton();
+$("play-btn").addEventListener("click", () => playing ? pause() : play());
+$("back10").addEventListener("click", () => seek(t - 10));
+$("fwd10").addEventListener("click", () => seek(t + 10));
+$("speed").addEventListener("change", (e) => { speed = +e.target.value; });
+
+addEventListener("keydown", (e) => {
+  if (!file || $("play").hidden || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.closest("input, select, textarea") || (e.key === " " && e.target.closest("button"))) return;
+  const step = e.shiftKey ? 10 : 1;
+  const keys = {
+    " ": () => playing ? pause() : play(), ArrowLeft: () => seek(t - step), ArrowRight: () => seek(t + step),
+    Home: () => seek(0), End: () => seek(file.duration), ",": () => stepMessage(-1), ".": () => stepMessage(1),
+    Escape: () => zoom && setZoom(null),
+  };
+  if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
+});
+
+// ---------- Timeline ----------
+let armedBands = [];
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+function fitCanvas(canvas) {
+  const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(r.width * dpr)); canvas.height = Math.max(1, Math.round(r.height * dpr));
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, r.width, r.height];
+}
+function drawScrub() {
+  if (!file) return;
+  const [ctx, w, h] = fitCanvas($("scrub-canvas"));
+  ctx.clearRect(0, 0, w, h);
+  const bins = file.density, max = Math.max(1, ...bins), bw = w / bins.length;
+  ctx.fillStyle = css("--muted"); ctx.globalAlpha = .35;
+  for (let i = 0; i < bins.length; i++) {
+    if (!bins[i]) continue;
+    const bh = Math.max(1, Math.sqrt(bins[i] / max) * (h - 10));
+    ctx.fillRect(i * bw, h - 5 - bh, Math.max(bw, 1), bh);
+  }
+  ctx.globalAlpha = 1;
+  const x = (s) => s / (file.duration || 1) * w;
+  ctx.fillStyle = css("--rec");
+  for (const [a, b] of armedBands) ctx.fillRect(x(a), h - 4, Math.max(2, x(b) - x(a)), 4);
+  ctx.fillStyle = css("--warn");
+  for (const e of file.events) ctx.fillRect(x(e) - 1, 0, 2, 6);
+  drawZoomWindow();
+}
+function drawZoomWindow() {
+  const z = $("scrub-zoom");
+  z.hidden = !zoom;
+  if (zoom) { z.style.left = `${zoom[0] / file.duration * 100}%`; z.style.width = `${(zoom[1] - zoom[0]) / file.duration * 100}%`; }
+}
+$("scrub").title = "Bars: how many messages. Red underline: armed. Yellow ticks: logger events.";
+{
+  const scrub = $("scrub");
+  const at = (e) => { const r = scrub.getBoundingClientRect(); return (e.clientX - r.left) / r.width * file.duration; };
+  let wasPlaying = false;
+  scrub.addEventListener("pointerdown", (e) => { if (!file) return; scrub.setPointerCapture(e.pointerId); wasPlaying = playing; pause(); seek(at(e)); });
+  scrub.addEventListener("pointermove", (e) => { if (scrub.hasPointerCapture(e.pointerId)) seek(at(e)); });
+  scrub.addEventListener("pointerup", (e) => { scrub.releasePointerCapture(e.pointerId); if (wasPlaying) play(); });
+}
+
+// ---------- Plots ----------
+function labelOf(chan, path) {
+  const [, name] = groupOf(topicByChan.get(chan));
+  const p = path[0] === "data" ? path.slice(1) : path;
+  return `${name} · ${(p[0] === "message" ? p.slice(1) : p).join(".")}`;
+}
+function addSeries(chan, path) {
+  const color = COLORS.find((c) => !series.some((s) => s.color === c)) ?? COLORS[series.length % COLORS.length];
+  const s = { chan, path, color, label: labelOf(chan, path), times: null, values: null, progress: 0, error: null };
+  series.push(s);
+  renderPlots();
+  s.el.scrollIntoView({ block: "nearest", behavior: reduced ? "auto" : "smooth" });
+  columnOf(chan, path, (p) => { s.progress = p; drawPlot(s); })
+    .then((r) => { s.times = r.times; s.values = r.values; drawPlot(s); drawPlotCursor(s); })
+    .catch((error) => { s.error = error.message; drawPlot(s); });
+}
+// One read of the file serves every field of the topics it reads: see the worker's series(). Asking for a MAVLink topic
+// reads all of them, which costs little more than reading one.
+let columnCache = new Map();
+function columnOf(chan, path, onProgress = () => {}) {
+  const want = JSON.stringify(path);
+  let entry = columnCache.get(chan);
+  if (!entry || (entry.result && !(want in entry.result.columns))) {
+    const mavlink = (c) => topicByChan.get(c).startsWith("/mavlink/");
+    const batch = !entry && mavlink(chan) ? [chan, ...file.topics.map((x) => x.chan).filter((c) => c !== chan && mavlink(c) && !columnCache.has(c))] : [chan];
+    const listeners = new Set();
+    const pass = ask({ series: { wanted: batch, want: { [chan]: want } } }, (p) => listeners.forEach((f) => f(p)));
+    for (const c of batch) {
+      const e = { listeners };
+      e.promise = pass.then((r) => (e.result = r[c]));
+      columnCache.set(c, e);
+    }
+    entry = columnCache.get(chan);
+  }
+  entry.listeners.add(onProgress);
+  return entry.promise.then((r) => want in r.columns ? { times: r.times, values: r.columns[want] } : columnOf(chan, path, onProgress));
+}
+function removeSeries(s) {
+  series = series.filter((x) => x !== s);
+  renderPlots();
+}
+function renderPlots() {
+  const body = $("plots");
+  if (!series.length) {
+    body.innerHTML = '<div class="empty">Plot any number from the message on the left: hover it and press <strong>+ Plot</strong>. It is drawn over the whole recording, and clicking a plot moves the playhead there.</div>';
+    return;
+  }
+  body.innerHTML = "";
+  for (const s of series) {
+    const row = document.createElement("div");
+    row.className = "plot-row";
+    row.innerHTML = `<div class="plot-head"><span class="swatch" style="background:${s.color}"></span>
+        <span class="name" title="${esc(topicByChan.get(s.chan))} ${esc(s.path.join("."))}">${esc(s.label)}</span>
+        <span class="val num"></span>
+        <button class="btn ghost" type="button" aria-label="Remove ${esc(s.label)}" title="Remove">${icons.close}</button></div>
+      <div class="plot-area"><canvas></canvas><div class="sel" hidden></div><div class="hover" hidden></div><div class="cursor"></div><div class="status"></div></div>`;
+    body.append(row);
+    s.el = row;
+    row.querySelector("button").addEventListener("click", () => { removeSeries(s); if (s.chan === selected) drawTree(); });
+    bindPlot(s);
+    drawPlot(s);
+    drawPlotCursor(s);
+  }
+}
+const range = () => zoom ?? [0, file.duration || 1];
+function lastIndex(times, x) {
+  let lo = 0, hi = times.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (times[mid] <= x) lo = mid + 1; else hi = mid; }
+  return lo - 1;
+}
+const valueText = (v) => Number.isNaN(v) ? "–" : Number.isInteger(v) ? fmt.format(v) : Math.abs(v) >= 1000 ? v.toFixed(1) : Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3);
+function drawPlot(s) {
+  if (!s.el) return;
+  const status = s.el.querySelector(".status");
+  status.textContent = s.error ?? (s.times ? (s.times.length ? "" : "No values") : `Reading ${Math.round(s.progress * 100)}%`);
+  const [ctx, w, h] = fitCanvas(s.el.querySelector("canvas"));
+  ctx.clearRect(0, 0, w, h);
+  if (!s.times || !s.times.length) return;
+  const [x0, x1] = range(), a = Math.max(0, lastIndex(s.times, x0)), b = Math.min(s.times.length - 1, lastIndex(s.times, x1) + 1);
+  let lo = Infinity, hi = -Infinity;
+  for (let k = a; k <= b; k++) { const v = s.values[k]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (lo === Infinity) return;
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * .08, top = 8, bottom = h - 8;
+  lo -= pad; hi += pad;
+  s.scale = { lo, hi, top, bottom };
+  const X = (tt) => (tt - x0) / (x1 - x0) * w, Y = (v) => bottom - (v - lo) / (hi - lo) * (bottom - top);
+  ctx.strokeStyle = css("--border"); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, Y((lo + hi) / 2)); ctx.lineTo(w, Y((lo + hi) / 2)); ctx.stroke();
+  ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.lineJoin = "round";
+  ctx.beginPath();
+  // Many points per pixel: a min-max bar per pixel column keeps every spike visible.
+  let pen = false, col = -1, cmin = 0, cmax = 0, clast = 0;
+  const flush = () => { if (col < 0) return; const x = col + .5; if (pen) ctx.lineTo(x, Y(cmin)); else ctx.moveTo(x, Y(cmin)); ctx.lineTo(x, Y(cmax)); ctx.lineTo(x, Y(clast)); pen = true; };
+  const dense = b - a > w * 2;
+  for (let k = a; k <= b; k++) {
+    const v = s.values[k];
+    if (Number.isNaN(v)) { flush(); col = -1; pen = false; continue; }
+    if (!dense) { const x = X(s.times[k]), y = Y(v); pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y); pen = true; continue; }
+    const c = Math.floor(X(s.times[k]));
+    if (c !== col) { flush(); col = c; cmin = cmax = v; }
+    cmin = Math.min(cmin, v); cmax = Math.max(cmax, v); clast = v;
+  }
+  if (dense) flush();
+  ctx.stroke();
+  ctx.fillStyle = css("--muted"); ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "top";
+  ctx.fillText(valueText(hi - pad), 6, 4);
+  ctx.textBaseline = "bottom";
+  ctx.fillText(valueText(lo + pad), 6, h - 4);
+}
+function drawPlotCursor(s) {
+  if (!s.el) return;
+  const [x0, x1] = range(), cursor = s.el.querySelector(".cursor");
+  cursor.hidden = t < x0 || t > x1;
+  cursor.style.left = `${(t - x0) / (x1 - x0) * 100}%`;
+  const k = s.times ? lastIndex(s.times, t) : -1;
+  s.el.querySelector(".val").textContent = k >= 0 ? valueText(s.values[k]) : "";
+}
+function bindPlot(s) {
+  const area = s.el.querySelector(".plot-area"), sel = area.querySelector(".sel"), hover = area.querySelector(".hover"), tip = $("plot-tip");
+  const at = (e) => { const r = area.getBoundingClientRect(), [x0, x1] = range(); return x0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * (x1 - x0); };
+  let from = null, fromX = 0;
+  area.addEventListener("pointerdown", (e) => { area.setPointerCapture(e.pointerId); from = at(e); fromX = e.clientX; });
+  area.addEventListener("pointermove", (e) => {
+    const x = at(e), [x0, x1] = range(), pct = (v) => `${(v - x0) / (x1 - x0) * 100}%`;
+    hover.hidden = false; hover.style.left = pct(x);
+    if (s.times?.length) {
+      const k = lastIndex(s.times, x);
+      tip.hidden = false;
+      tip.textContent = `${clockText(x)}  ${k >= 0 ? valueText(s.values[k]) : "–"}`;
+      tip.style.left = `${Math.min(innerWidth - tip.offsetWidth - 8, e.clientX + 12)}px`; tip.style.top = `${e.clientY - 34}px`;
+    }
+    if (from !== null && Math.abs(e.clientX - fromX) > 4) {
+      sel.hidden = false;
+      sel.style.left = pct(Math.min(from, x)); sel.style.width = `${Math.abs(x - from) / (x1 - x0) * 100}%`;
+    }
+  });
+  area.addEventListener("pointerleave", () => { hover.hidden = true; tip.hidden = true; });
+  area.addEventListener("pointerup", (e) => {
+    const x = at(e);
+    sel.hidden = true;
+    if (from !== null && Math.abs(e.clientX - fromX) > 4) setZoom([Math.min(from, x), Math.max(from, x)]);
+    else if (from !== null) seek(x);
+    from = null;
+  });
+  area.addEventListener("dblclick", () => setZoom(null));
+}
+function setZoom(z) {
+  zoom = z && z[1] - z[0] > 0.05 ? z : null;
+  $("zoom-reset").hidden = !zoom;
+  drawZoomWindow();
+  for (const s of series) { drawPlot(s); drawPlotCursor(s); }
+}
+$("zoom-reset").addEventListener("click", () => setZoom(null));
+
+function sizeCanvases() { drawScrub(); for (const s of series) drawPlot(s); }
+new ResizeObserver(() => file && !$("play").hidden && sizeCanvases()).observe(document.body);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => file && sizeCanvases());
+
+// ---------- Start ----------
+const wanted = new URLSearchParams(location.hash.slice(1)).get("file");
+show("pick");
+listVehicle().then(() => {
+  const rec = wanted && vehicleRecordings.find((r) => r.name === wanted);
+  if (rec) openFromVehicle(rec);
+  else if (wanted) openFromVehicle({ name: wanted, size: 0 });
+});
+</script>
+</body>
+</html>
